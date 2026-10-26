@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="${ECHOBRIDGE_TTS_PYTHON:-$HOME/.venvs/echobridge-tts/bin/python}"
+if [[ ! -x "$PYTHON" ]]; then
+  echo "TTS venv not found: $PYTHON" >&2
+  exit 1
+fi
+
+export ECHOBRIDGE_TTS_MODEL="${ECHOBRIDGE_TTS_MODEL:-$HOME/.cache/echobridge/models/Qwen3-TTS-12Hz-0.6B-Base}"
+export ECHOBRIDGE_TTS_VOICE_DIR="${ECHOBRIDGE_TTS_VOICE_DIR:-$HOME/.cache/echobridge/voices/mingyue}"
+export ECHOBRIDGE_TTS_REFERENCE="${ECHOBRIDGE_TTS_REFERENCE:-$ECHOBRIDGE_TTS_VOICE_DIR/reference.wav}"
+export ECHOBRIDGE_TTS_REFERENCE_TEXT="${ECHOBRIDGE_TTS_REFERENCE_TEXT:-$ECHOBRIDGE_TTS_VOICE_DIR/reference.txt}"
+export ECHOBRIDGE_TTS_PROMPT="${ECHOBRIDGE_TTS_PROMPT:-$ECHOBRIDGE_TTS_VOICE_DIR/prompt.pt}"
+export ECHOBRIDGE_TTS_PROMPT_META="${ECHOBRIDGE_TTS_PROMPT_META:-$ECHOBRIDGE_TTS_VOICE_DIR/prompt.meta.json}"
+export ECHOBRIDGE_TTS_HOST="${ECHOBRIDGE_TTS_HOST:-127.0.0.1}"
+export ECHOBRIDGE_TTS_PORT="${ECHOBRIDGE_TTS_PORT:-18802}"
+export ECHOBRIDGE_TTS_LANGUAGE="${ECHOBRIDGE_TTS_LANGUAGE:-Chinese}"
+export ECHOBRIDGE_TTS_MAX_NEW_TOKENS="${ECHOBRIDGE_TTS_MAX_NEW_TOKENS:-512}"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+
+echo "EchoBridge TTS worker"
+echo "  model: ${ECHOBRIDGE_TTS_MODEL}"
+echo "  voice: ${ECHOBRIDGE_TTS_VOICE_DIR}"
+echo "  bind:  ${ECHOBRIDGE_TTS_HOST}:${ECHOBRIDGE_TTS_PORT}"
+exec "$PYTHON" -m echobridge.tts_worker

@@ -4,7 +4,7 @@
 
 A lightweight, model-agnostic voice gateway that connects streaming ASR, LLM, and TTS services through a unified Realtime API.
 
-> 🚧 **Status: Phase 2.** The Doubao-compatible gateway, Silero VAD, Qwen3-ASR-0.6B worker, mock LLM/TTS, protocol tests, and an X10A device probe are implemented. See [`docs/PHASE2.md`](docs/PHASE2.md) for ASR/VAD run and benchmark details; local TTS and DeepSeek land in Phases 3–4.
+> 🚧 **Status: Phase 3.** The Doubao-compatible gateway, Silero VAD, Qwen3-ASR-0.6B, and Qwen3-TTS-12Hz-0.6B-Base via vLLM-Omni are implemented; DeepSeek and device dual-backend integration land in Phases 4–5. See [`docs/PHASE3.md`](docs/PHASE3.md) for TTS/voice and benchmark details.
 
 ---
 

@@ -53,6 +53,14 @@ class Settings:
     asr_timeout_s: float = 8.0
     mock_asr_text: str = "你好呀，溟月"
 
+    tts_backend: str = "mock"
+    tts_url: str = "http://127.0.0.1:18802"
+    tts_timeout_s: float = 30.0
+    tts_voice_id: str = "mingyue_v1"
+    tts_ref_audio: str = "~/.cache/echobridge/voices/mingyue/reference.wav"
+    tts_ref_text: str = "~/.cache/echobridge/voices/mingyue/reference.txt"
+    tts_api_key: str = "EMPTY"
+
     # Mock LLM/TTS pacing.
     llm_char_delay_ms: int = 12
     tts_first_chunk_ms: int = 60
@@ -95,6 +103,20 @@ class Settings:
             asr_url=os.environ.get("ECHOBRIDGE_ASR_URL", "http://127.0.0.1:18801").rstrip("/"),
             asr_timeout_s=float(os.environ.get("ECHOBRIDGE_ASR_TIMEOUT_S", "8")),
             mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀，溟月"),
+            tts_backend=os.environ.get("ECHOBRIDGE_TTS_BACKEND", "mock").strip().lower(),
+            tts_url=os.environ.get("ECHOBRIDGE_TTS_URL", "http://127.0.0.1:18802").rstrip("/"),
+            tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),
+            tts_voice_id=os.environ.get("ECHOBRIDGE_TTS_VOICE_ID", "mingyue_v1").strip()
+            or "mingyue_v1",
+            tts_ref_audio=os.environ.get(
+                "ECHOBRIDGE_TTS_REF_AUDIO",
+                "~/.cache/echobridge/voices/mingyue/reference.wav",
+            ),
+            tts_ref_text=os.environ.get(
+                "ECHOBRIDGE_TTS_REF_TEXT",
+                "~/.cache/echobridge/voices/mingyue/reference.txt",
+            ),
+            tts_api_key=os.environ.get("ECHOBRIDGE_TTS_API_KEY", "EMPTY"),
             llm_char_delay_ms=_env_int("ECHOBRIDGE_LLM_CHAR_DELAY_MS", 12),
             tts_first_chunk_ms=_env_int("ECHOBRIDGE_TTS_FIRST_CHUNK_MS", 60),
             tts_tone_char_ms=_env_int("ECHOBRIDGE_TTS_TONE_CHAR_MS", 55),

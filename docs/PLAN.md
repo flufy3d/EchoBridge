@@ -2,7 +2,7 @@
 
 > 目标：把明月 Live（X10A）的豆包端到端实时语音替换为「本地 ASR + DeepSeek + 本地 TTS」的自托管网关，同时保持设备端豆包 Realtime 协议子集兼容，并保留豆包后端与自动回退。
 >
-> 状态：Phase 2 完成（主机侧；X10A 实录音/远场 WER 待补）。Phase 0/1/2 结果见 `docs/PHASE1.md` 与 `docs/PHASE2.md`。本文定义协议、边界、验收和阶段计划。
+> 状态：Phase 3 完成（主机侧；主观音色/10 分钟试听待用户，X10A 实录音/远场 WER 待补）。Phase 0/1/2/3 结果见 `docs/PHASE1.md`、`docs/PHASE2.md`、`docs/PHASE3.md`。本文定义协议、边界、验收和阶段计划。
 >
 > 基线仓库：`E:\Projects\EchoBridge`（空仓库，仅 README）、`E:\Projects\mingyue-live`（M6，App 0.6.0）。
 

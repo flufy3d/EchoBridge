@@ -27,7 +27,7 @@ from .logging import get_logger
 from .pacer import AudioPacer
 from .text import split_for_tts
 from .tools import available_tool_names, convert_tools
-from .tts import MockTTS
+from .tts import TTSBackend
 from .vad import VADBackend, VADEvent, make_vad
 
 logger = get_logger("echobridge.session")
@@ -52,6 +52,7 @@ class Session:
         mock_asr_text: str | None = None,
         asr: ASRBackend | None = None,
         vad: VADBackend | None = None,
+        tts: TTSBackend | None = None,
     ) -> None:
         self._ws = ws
         self._settings = settings
@@ -84,7 +85,9 @@ class Session:
         self._spec_task: asyncio.Task | None = None
         self._spec_item = ""
         self._llm = MockLLM(settings.llm_char_delay_ms)
-        self._tts = MockTTS(settings)
+        from .tts import make_tts
+
+        self._tts = tts or make_tts(settings)
         self._asr = asr or MockASR(self._mock_asr_text)
         self._vad = vad or make_vad(settings)
 

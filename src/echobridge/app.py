@@ -14,6 +14,7 @@ from .asr import make_asr
 from .config import Settings
 from .logging import get_logger
 from .manager import SessionManager
+from .tts import make_tts
 from .vad import make_vad
 
 logger = get_logger("echobridge.app")
@@ -43,6 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     manager = SessionManager()
     shared_vad = make_vad(settings)
     shared_asr = make_asr(settings) if settings.asr_backend == "qwen3" else None
+    shared_tts = make_tts(settings) if settings.tts_backend == "qwen3" else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -51,10 +53,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await shared_asr.warmup()
             except Exception as exc:
                 logger.warning("ASR warmup failed: %s", exc)
+        if shared_tts is not None:
+            try:
+                await shared_tts.warmup()
+            except Exception as exc:
+                logger.warning("TTS warmup failed: %s", exc)
         yield
         await manager.close_active("shutdown")
         if shared_asr is not None:
             await shared_asr.close()
+        if shared_tts is not None:
+            await shared_tts.close()
 
     app = FastAPI(title="EchoBridge", version=__version__, lifespan=lifespan)
     app.state.settings = settings
@@ -70,6 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "backend": "mock",
                 "vad": settings.vad_backend,
                 "asr": settings.asr_backend,
+                "tts": settings.tts_backend,
                 "active": None
                 if active is None
                 else {
@@ -129,6 +139,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             mock_asr_text=asr_text,
             asr=session_asr,
             vad=shared_vad,
+            tts=shared_tts,
         )
         if session is None:
             await ws.close(code=1013, reason="busy")
