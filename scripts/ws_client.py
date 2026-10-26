@@ -184,22 +184,34 @@ class Client:
         ), "greeting must not emit text deltas"
         return done
 
-    async def turn(self) -> dict[str, Any]:
+    async def turn(self, wav_pcm: bytes | None = None) -> dict[str, Any]:
         start = len(self.events)
-        for _ in range(30):
-            await self.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(loud_frame()).decode("ascii"),
-                }
-            )
-        for _ in range(35):
+        if wav_pcm:
+            for offset in range(0, len(wav_pcm) - 639, 640):
+                frame = wav_pcm[offset : offset + 640]
+                await self.send(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(frame).decode("ascii"),
+                    }
+                )
+                await asyncio.sleep(0.02)
+        else:
+            for _ in range(30):
+                await self.send(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(loud_frame()).decode("ascii"),
+                    }
+                )
+        for _ in range(40):
             await self.send(
                 {
                     "type": "input_audio_buffer.append",
                     "audio": base64.b64encode(silence_frame()).decode("ascii"),
                 }
             )
+            await asyncio.sleep(0.02)
         completed = await self.wait_for(
             "conversation.item.input_audio_transcription.completed", after=start
         )
@@ -317,7 +329,7 @@ async def run(args: argparse.Namespace) -> int:
 
         if args.scenario in ("turn", "all"):
             print("scenario: turn")
-            await client.turn()
+            await client.turn(read_wav_pcm16_16k(args.wav) if args.wav else None)
             assert any(
                 event.get("type") == "response.output_text.done" for event in client.events
             )
@@ -326,7 +338,7 @@ async def run(args: argparse.Namespace) -> int:
         if args.scenario == "tool":
             print("scenario: tool")
             tool_start = len(client.events)
-            await client.turn()
+            await client.turn(read_wav_pcm16_16k(args.wav) if args.wav else None)
             assert any(
                 event.get("type") == "response.function_call_arguments.done"
                 for event in client.events[tool_start:]
@@ -354,6 +366,17 @@ async def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def read_wav_pcm16_16k(path: str) -> bytes:
+    with wave.open(path, "rb") as handle:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        rate = handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+    if width != 2 or channels != 1 or rate != 16000:
+        raise SystemExit("WAV must be mono PCM16 16 kHz")
+    return frames
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -368,6 +391,7 @@ def main() -> None:
     )
     parser.add_argument("--no-device-id", action="store_true")
     parser.add_argument("--save-wav", default="var/last_response.wav")
+    parser.add_argument("--wav", default="", help="16 kHz mono PCM16 speech for turn scenarios")
     args = parser.parse_args()
     raise SystemExit(asyncio.run(run(args)))
 

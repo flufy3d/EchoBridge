@@ -34,12 +34,23 @@ class Settings:
     token: str = "dev-token"
     device_id: str = "x10a"
 
-    # Mock ASR/VAD.  Phase 2 replaces the VAD and ASR adapter.
+    # VAD / ASR.  "energy" and "mock" keep Phase 1 tests deterministic.
+    vad_backend: str = "energy"
     vad_threshold: int = 700
     vad_start_frames: int = 2
-    vad_endpoint_ms: int = 600
+    vad_endpoint_ms: int = 500
     vad_min_speech_ms: int = 200
     vad_max_speech_ms: int = 15_000
+    vad_pre_roll_ms: int = 300
+    vad_tail_pad_ms: int = 100
+    vad_speculative_lead_ms: int = 150
+    vad_start_ms: int = 64
+    silero_threshold: float = 0.5
+    silero_model: str | None = None
+
+    asr_backend: str = "mock"
+    asr_url: str = "http://127.0.0.1:18801"
+    asr_timeout_s: float = 8.0
     mock_asr_text: str = "你好呀，溟月"
 
     # Mock LLM/TTS pacing.
@@ -68,11 +79,21 @@ class Settings:
             port=_env_int("ECHOBRIDGE_PORT", 18787),
             token=token,
             device_id=os.environ.get("ECHOBRIDGE_DEVICE_ID", "x10a").strip() or "x10a",
+            vad_backend=os.environ.get("ECHOBRIDGE_VAD_BACKEND", "energy").strip().lower(),
             vad_threshold=_env_int("ECHOBRIDGE_VAD_THRESHOLD", 700),
             vad_start_frames=_env_int("ECHOBRIDGE_VAD_START_FRAMES", 2),
-            vad_endpoint_ms=_env_int("ECHOBRIDGE_VAD_ENDPOINT_MS", 600),
+            vad_endpoint_ms=_env_int("ECHOBRIDGE_VAD_ENDPOINT_MS", 500),
             vad_min_speech_ms=_env_int("ECHOBRIDGE_VAD_MIN_SPEECH_MS", 200),
             vad_max_speech_ms=_env_int("ECHOBRIDGE_VAD_MAX_SPEECH_MS", 15_000),
+            vad_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_PRE_ROLL_MS", 300),
+            vad_tail_pad_ms=_env_int("ECHOBRIDGE_VAD_TAIL_PAD_MS", 100),
+            vad_speculative_lead_ms=_env_int("ECHOBRIDGE_VAD_SPECULATIVE_LEAD_MS", 150),
+            vad_start_ms=_env_int("ECHOBRIDGE_VAD_START_MS", 64),
+            silero_threshold=float(os.environ.get("ECHOBRIDGE_SILERO_THRESHOLD", "0.5")),
+            silero_model=os.environ.get("ECHOBRIDGE_SILERO_MODEL") or None,
+            asr_backend=os.environ.get("ECHOBRIDGE_ASR_BACKEND", "mock").strip().lower(),
+            asr_url=os.environ.get("ECHOBRIDGE_ASR_URL", "http://127.0.0.1:18801").rstrip("/"),
+            asr_timeout_s=float(os.environ.get("ECHOBRIDGE_ASR_TIMEOUT_S", "8")),
             mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀，溟月"),
             llm_char_delay_ms=_env_int("ECHOBRIDGE_LLM_CHAR_DELAY_MS", 12),
             tts_first_chunk_ms=_env_int("ECHOBRIDGE_TTS_FIRST_CHUNK_MS", 60),

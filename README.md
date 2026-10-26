@@ -4,7 +4,7 @@
 
 A lightweight, model-agnostic voice gateway that connects streaming ASR, LLM, and TTS services through a unified Realtime API.
 
-> 🚧 **Status: Phase 1.** The Doubao-compatible WebSocket gateway, mock ASR/LLM/TTS, protocol tests, and an X10A device probe are implemented. See [`docs/PHASE1.md`](docs/PHASE1.md) for run and test instructions; local ASR/TTS/DeepSeek land in Phases 2–4.
+> 🚧 **Status: Phase 2.** The Doubao-compatible gateway, Silero VAD, Qwen3-ASR-0.6B worker, mock LLM/TTS, protocol tests, and an X10A device probe are implemented. See [`docs/PHASE2.md`](docs/PHASE2.md) for ASR/VAD run and benchmark details; local TTS and DeepSeek land in Phases 3–4.
 
 ---
 

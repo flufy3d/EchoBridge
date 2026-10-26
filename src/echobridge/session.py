@@ -15,10 +15,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import uuid
 from typing import Any, Protocol
 
 from . import protocol
+from .asr import ASRBackend, MockASR
 from .config import Settings
 from .llm import MockLLM, MockPlan
 from .logging import get_logger
@@ -26,7 +28,7 @@ from .pacer import AudioPacer
 from .text import split_for_tts
 from .tools import available_tool_names, convert_tools
 from .tts import MockTTS
-from .vad import EnergyVAD, VADEvent
+from .vad import VADBackend, VADEvent, make_vad
 
 logger = get_logger("echobridge.session")
 
@@ -48,6 +50,8 @@ class Session:
         session_id: str | None = None,
         device_id: str = "unknown",
         mock_asr_text: str | None = None,
+        asr: ASRBackend | None = None,
+        vad: VADBackend | None = None,
     ) -> None:
         self._ws = ws
         self._settings = settings
@@ -77,9 +81,12 @@ class Session:
         self._history: list[dict[str, str]] = []
 
         self._speech_buffers: dict[str, str] = {}
+        self._spec_task: asyncio.Task | None = None
+        self._spec_item = ""
         self._llm = MockLLM(settings.llm_char_delay_ms)
         self._tts = MockTTS(settings)
-        self._vad = EnergyVAD(settings)
+        self._asr = asr or MockASR(self._mock_asr_text)
+        self._vad = vad or make_vad(settings)
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -132,7 +139,9 @@ class Session:
         if self._closing or self._closed:
             return
         self._closing = True
+        self._discard_speculative_asr()
         await self._cancel_active(send_canceled=False, reason=f"close:{reason}")
+        self._vad.reset()
         if not self._closed:
             await self._send(protocol.session_closed(reason), force=True)
         self._closed = True
@@ -188,6 +197,7 @@ class Session:
         self._tools_openai = convert_tools(self._tools_volc)
         self._tool_names = available_tool_names(self._tools_openai)
         self._created = True
+        self._vad.reset()
         await self._send(
             protocol.session_created(self._session_id, self._model, "echobridge-mock")
         )
@@ -221,7 +231,7 @@ class Session:
             return
         if not pcm:
             return
-        for vad_event in self._vad.push(pcm, self._mock_asr_text):
+        for vad_event in self._vad.push(pcm):
             await self._handle_vad_event(vad_event)
 
     async def _handle_vad_event(self, event: VADEvent) -> None:
@@ -229,14 +239,45 @@ class Session:
             await self._send(protocol.asr_started(event.item_id))
         elif event.kind == "delta":
             await self._send(protocol.asr_delta(event.item_id, event.text))
+        elif event.kind == "early":
+            self._start_speculative_asr(event)
+        elif event.kind == "resume":
+            self._discard_speculative_asr()
         elif event.kind == "final":
-            if not event.text.strip():
+            if not event.pcm or event.speech_ms < self._settings.vad_min_speech_ms:
+                self._discard_speculative_asr()
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
-            await self._send(
-                protocol.asr_completed(event.item_id, event.text.strip(), "zh")
+            asr_started = time.perf_counter()
+            result = await self._take_speculative_asr(event)
+            speculative = result is not None
+            if result is None:
+                try:
+                    result = await self._asr.transcribe(event.pcm, 16000)
+                except Exception:
+                    logger.exception(
+                        "asr failed item=%s bytes=%d", event.item_id, len(event.pcm)
+                    )
+                    await self._send(protocol.asr_failed(event.item_id, "asr_error"))
+                    return
+            asr_wall_ms = (time.perf_counter() - asr_started) * 1000.0
+            text = (result.text or "").strip()
+            if not text:
+                await self._send(protocol.asr_failed(event.item_id, "empty speech"))
+                return
+            logger.info(
+                "asr final item=%s chars=%d speech_ms=%d worker_ms=%.1f wall_ms=%.1f spec=%s",
+                event.item_id,
+                len(text),
+                event.speech_ms,
+                result.latency_ms,
+                asr_wall_ms,
+                "1" if speculative else "0",
             )
-            await self._start_turn(event.text.strip())
+            await self._send(
+                protocol.asr_completed(event.item_id, text, result.language or "zh")
+            )
+            await self._start_turn(text)
 
     async def _handle_speech(self, event: dict[str, Any]) -> None:
         speech_id = str(event.get("speech_id") or "default")
@@ -250,6 +291,51 @@ class Session:
         if self._response_active:
             await self._cancel_active(send_canceled=True, reason="greeting")
         await self._start_greeting(merged)
+
+    def _start_speculative_asr(self, event: VADEvent) -> None:
+        self._discard_speculative_asr()
+        if not event.pcm:
+            return
+        self._spec_item = event.item_id
+
+        async def run() -> Any:
+            return await self._asr.transcribe(event.pcm, 16000)
+
+        task = asyncio.create_task(run(), name=f"spec-asr-{event.item_id}")
+        self._spec_task = task
+        task.add_done_callback(self._consume_task_exception)
+
+    def _discard_speculative_asr(self) -> None:
+        task = self._spec_task
+        self._spec_task = None
+        self._spec_item = ""
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _take_speculative_asr(self, event: VADEvent):
+        task = self._spec_task
+        if task is None or self._spec_item != event.item_id:
+            return None
+        self._spec_task = None
+        self._spec_item = ""
+        try:
+            result = await asyncio.wait_for(task, timeout=1.5)
+        except Exception:
+            if not task.done():
+                task.cancel()
+            return None
+        if result is None or not (result.text or "").strip():
+            return None
+        return result
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            pass
 
     async def _handle_tool_results(self, event: dict[str, Any]) -> None:
         for result in protocol.extract_tool_results(event):
@@ -407,6 +493,7 @@ class Session:
         return len(buffer) >= limit
 
     async def _cancel_active(self, *, send_canceled: bool, reason: str) -> None:
+        self._discard_speculative_asr()
         old = self._active_ctx
         if old is None and not self._response_active:
             return
@@ -489,6 +576,8 @@ class Session:
                 return False
 
     async def _shutdown(self) -> None:
+        self._discard_speculative_asr()
+        self._vad.reset()
         if not self._closed:
             await self._cancel_active(send_canceled=False, reason="shutdown")
             self._closed = True

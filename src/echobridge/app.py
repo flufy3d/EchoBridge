@@ -10,9 +10,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import __version__
+from .asr import make_asr
 from .config import Settings
 from .logging import get_logger
 from .manager import SessionManager
+from .vad import make_vad
 
 logger = get_logger("echobridge.app")
 
@@ -39,11 +41,20 @@ def _has_probe_protocol(ws: WebSocket) -> bool:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     manager = SessionManager()
+    shared_vad = make_vad(settings)
+    shared_asr = make_asr(settings) if settings.asr_backend == "qwen3" else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if shared_asr is not None:
+            try:
+                await shared_asr.warmup()
+            except Exception as exc:
+                logger.warning("ASR warmup failed: %s", exc)
         yield
         await manager.close_active("shutdown")
+        if shared_asr is not None:
+            await shared_asr.close()
 
     app = FastAPI(title="EchoBridge", version=__version__, lifespan=lifespan)
     app.state.settings = settings
@@ -57,6 +68,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "ok": True,
                 "version": __version__,
                 "backend": "mock",
+                "vad": settings.vad_backend,
+                "asr": settings.asr_backend,
                 "active": None
                 if active is None
                 else {
@@ -108,11 +121,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         subprotocol = "echobridge" if _has_probe_protocol(ws) else None
         await ws.accept(subprotocol=subprotocol)
+        session_asr = shared_asr or make_asr(settings, asr_text)
         session = await manager.acquire(
             ws,
             device_id,
             settings=settings,
             mock_asr_text=asr_text,
+            asr=session_asr,
+            vad=shared_vad,
         )
         if session is None:
             await ws.close(code=1013, reason="busy")
