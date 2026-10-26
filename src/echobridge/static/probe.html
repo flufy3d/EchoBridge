@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>EchoBridge Phase 1 Probe</title>
+<style>
+  html, body { margin: 0; background: #10141c; color: #e7edf7; font-family: sans-serif; }
+  body { padding: 14px; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  .hint { color: #8d9bb0; font-size: 12px; line-height: 1.5; margin-bottom: 10px; }
+  label { display: block; font-size: 12px; color: #aab8cc; margin: 8px 0 3px; }
+  input { width: 100%; box-sizing: border-box; padding: 8px; font-size: 14px;
+          background: #1b2230; color: #e7edf7; border: 1px solid #33405a; border-radius: 6px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button { flex: 1 1 140px; padding: 11px 8px; font-size: 14px; border-radius: 7px;
+           border: 1px solid #3b4b6a; background: #243149; color: #e7edf7; }
+  button:active { background: #30415f; }
+  button:disabled { opacity: .45; }
+  #status { margin-top: 10px; font-size: 13px; color: #7fe0b0; }
+  #log { margin-top: 10px; height: 42vh; overflow: auto; background: #0b0f16;
+         border: 1px solid #263149; border-radius: 6px; padding: 8px; font-size: 11px;
+         font-family: monospace; white-space: pre-wrap; }
+  .ok { color: #7fe0b0; }
+  .err { color: #ff8b8b; }
+  .dim { color: #6f7f96; }
+</style>
+</head>
+<body>
+<h1>EchoBridge Phase 1 Probe</h1>
+<div class="hint">
+  在 X10A 上验证 WSS、20 ms 音频、greeting、mock ASR/LLM/TTS、tool call、cancel 和 close。
+  页面不发真实麦克风，只发送可重复的 16 kHz PCM 测试音；音频以 24 kHz PCM 播放。
+</div>
+
+<label for="url">WebSocket URL</label>
+<input id="url" autocomplete="off">
+
+<label for="token">Token（可放在 URL #token=...，不会发送给 HTTP 服务器）</label>
+<input id="token" type="password" autocomplete="off">
+
+<label for="asr">Mock ASR 文本（重连后生效）</label>
+<input id="asr" value="你好呀，溟月" autocomplete="off">
+
+<div class="row">
+  <button id="connect">连接</button>
+  <button id="greet" disabled>打招呼</button>
+  <button id="speak" disabled>模拟说话</button>
+  <button id="cancel" disabled>打断</button>
+  <button id="close" disabled>关闭会话</button>
+</div>
+<div id="status">未连接</div>
+<div id="log"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var ws = null;
+  var audioCtx = null;
+  var nextAudioTime = 0;
+  var sources = [];
+  var sessionReady = false;
+  var sendingSpeech = false;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var logEl = $('log');
+  var statusEl = $('status');
+
+  function log(text, cls) {
+    var line = document.createElement('div');
+    if (cls) line.className = cls;
+    var now = new Date();
+    var stamp = ('0' + now.getHours()).slice(-2) + ':' +
+                ('0' + now.getMinutes()).slice(-2) + ':' +
+                ('0' + now.getSeconds()).slice(-2);
+    line.textContent = '[' + stamp + '] ' + text;
+    logEl.appendChild(line);
+    while (logEl.childNodes.length > 250) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || '';
+  }
+
+  function defaultWsUrl() {
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    return proto + location.host + '/echobridge/ws';
+  }
+
+  function tokenFromHash() {
+    var hash = location.hash || '';
+    if (hash.indexOf('#token=') === 0) return decodeURIComponent(hash.substring(7));
+    return '';
+  }
+
+  function asrFromQuery() {
+    var match = (location.search || '').match(/[?&]asr_text=([^&]*)/);
+    return match ? decodeURIComponent(match[1]) : '你好呀，溟月';
+  }
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new Ctor();
+      nextAudioTime = 0;
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  }
+
+  function stopAudio() {
+    for (var i = 0; i < sources.length; i++) {
+      try { sources[i].stop(); } catch (e) {}
+    }
+    sources = [];
+    if (audioCtx) nextAudioTime = audioCtx.currentTime;
+    log('local audio flushed', 'dim');
+  }
+
+  function playPcmBase64(b64) {
+    ensureAudio();
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 255;
+    var samples = new Int16Array(bytes.buffer);
+    if (!samples.length) return;
+    var buffer = audioCtx.createBuffer(1, samples.length, 24000);
+    var channel = buffer.getChannelData(0);
+    for (var j = 0; j < samples.length; j++) channel[j] = samples[j] / 32768;
+    var source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioCtx.destination);
+    var startAt = Math.max(audioCtx.currentTime + 0.02, nextAudioTime);
+    source.start(startAt);
+    nextAudioTime = startAt + buffer.duration;
+    sources.push(source);
+    source.onended = function () {
+      var index = sources.indexOf(source);
+      if (index >= 0) sources.splice(index, 1);
+    };
+  }
+
+  function send(obj) {
+    if (!ws || ws.readyState !== 1) return false;
+    ws.send(JSON.stringify(obj));
+    return true;
+  }
+
+  function eventId() {
+    return 'probe_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+  }
+
+  function buildTools() {
+    return [
+      {
+        type: 'function',
+        name: 'set_emotion',
+        description: '改变表情',
+        parameters: {
+          type: 'object',
+          properties: { emotion: { type: 'string', enum: ['happy', 'love', 'neutral'] } },
+          required: ['emotion']
+        }
+      },
+      {
+        type: 'function',
+        name: 'play_animation',
+        description: '播放动作',
+        parameters: {
+          type: 'object',
+          properties: { name: { type: 'string', enum: ['idle', 'spin', 'greet'] } },
+          required: ['name']
+        }
+      },
+      {
+        type: 'function',
+        name: 'get_time',
+        description: '获取当前时间',
+        parameters: { type: 'object', properties: {} }
+      }
+    ];
+  }
+
+  function sendSessionCreate() {
+    send({
+      type: 'session.create',
+      event_id: eventId(),
+      session: {
+        model: '1.2.6.1',
+        instructions: '',
+        audio: {
+          input: { format: { type: 'pcm', rate: 16000 } },
+          output: { format: { type: 'pcm_s16le', rate: 24000 }, voice: 'mingyue_v1' }
+        },
+        tools: buildTools()
+      },
+      extension: {
+        asr: { extra: {} },
+        tts: { extra: {} },
+        dialog: { extra: { enable_loudness_norm: true } }
+      }
+    });
+    log('sent session.create', 'dim');
+  }
+
+  function connect() {
+    if (ws) return;
+    ensureAudio();
+    var token = $('token').value.trim() || tokenFromHash();
+    $('token').value = token;
+    var url = $('url').value.trim() || defaultWsUrl();
+    var separator = url.indexOf('?') >= 0 ? '&' : '?';
+    url = url + separator + 'device_id=probe&asr_text=' +
+          encodeURIComponent($('asr').value.trim() || '你好呀，溟月');
+    var protocols = ['echobridge'];
+    if (token) protocols.push('token.' + token);
+    log('connecting ' + url, 'dim');
+    ws = new WebSocket(url, protocols);
+    ws.onopen = function () {
+      setStatus('已连接，等待 session.created', 'ok');
+      log('websocket open', 'ok');
+      updateButtons();
+      sendSessionCreate();
+    };
+    ws.onmessage = function (event) {
+      var msg;
+      try { msg = JSON.parse(event.data); } catch (e) {
+        log('bad json: ' + event.data, 'err');
+        return;
+      }
+      handleEvent(msg);
+    };
+    ws.onerror = function () {
+      log('websocket error', 'err');
+      setStatus('连接错误', 'err');
+    };
+    ws.onclose = function (event) {
+      log('websocket closed code=' + event.code + ' reason=' + event.reason, 'dim');
+      setStatus('已断开 code=' + event.code, 'err');
+      sessionReady = false;
+      ws = null;
+      updateButtons();
+    };
+    updateButtons();
+  }
+
+  function handleEvent(msg) {
+    var type = msg.type || '(no type)';
+    if (type === 'response.output_audio.delta') {
+      playPcmBase64(msg.delta || '');
+      log('audio.delta response=' + (msg.response_id || '?') +
+          ' b64=' + (msg.delta || '').length, 'dim');
+      return;
+    }
+    if (type === 'response.output_audio.started') {
+      log('audio.started response=' + (msg.response_id || '?'), 'ok');
+      return;
+    }
+    if (type === 'conversation.item.input_audio_transcription.delta') {
+      log('asr.delta ' + (msg.delta || ''), 'dim');
+      return;
+    }
+    if (type === 'response.output_text.delta') {
+      log('text.delta ' + (msg.delta || ''), 'dim');
+      return;
+    }
+    if (type === 'session.created') {
+      sessionReady = true;
+      setStatus('会话已建立：' + ((msg.session && msg.session.id) || '?'), 'ok');
+      log('session.created ' + JSON.stringify(msg.session || {}), 'ok');
+      updateButtons();
+      return;
+    }
+    if (type === 'response.function_call_arguments.done') {
+      log('tool.call ' + JSON.stringify(msg.items || []), 'err');
+      // This probe simulates a fast local tool executor.  The real app does the
+      // actual work (camera, Live2D, time, etc.).
+      var items = msg.items || [];
+      var results = [];
+      for (var i = 0; i < items.length; i++) {
+        results.push({
+          type: 'message',
+          role: 'tool',
+          call_id: items[i].call_id,
+          content: [{ type: 'input_text', text: 'ok' }]
+        });
+      }
+      send({ type: 'conversation.item.create', event_id: eventId(), items: results });
+      log('sent tool result x' + results.length, 'dim');
+      return;
+    }
+    if (type === 'response.canceled') {
+      stopAudio();
+      log('response.canceled', 'err');
+      return;
+    }
+    if (type === 'conversation.item.input_audio_transcription.completed') {
+      log('asr.completed ' + (msg.transcript || ''), 'ok');
+      return;
+    }
+    if (type === 'conversation.item.input_audio_transcription.failed') {
+      log('asr.failed ' + (msg.error || ''), 'err');
+      return;
+    }
+    if (type === 'response.output_text.done') {
+      log('text.done ' + (msg.text || ''), 'dim');
+      return;
+    }
+    if (type === 'response.output_audio.done') {
+      log('audio.done', 'dim');
+      return;
+    }
+    if (type === 'response.done') {
+      log('response.done status=' + (msg.status || '?'), 'ok');
+      return;
+    }
+    if (type === 'error') {
+      var error = msg.error || {};
+      log('ERROR ' + (error.message || JSON.stringify(error)), 'err');
+      setStatus('服务端错误', 'err');
+      return;
+    }
+    if (type === 'session.closed') {
+      log('session.closed ' + (msg.reason || ''), 'dim');
+      setStatus('会话已关闭', 'dim');
+      sessionReady = false;
+      updateButtons();
+      return;
+    }
+    log(type, 'dim');
+  }
+
+  function greeting() {
+    if (!sessionReady) return;
+    var text = '你来啦，我在呢。今天也要开开心心的呀。';
+    var speechId = 'greet_' + Date.now();
+    var split = text.length > 1 ? Math.floor(text.length * 0.5) : text.length;
+    send({
+      type: 'speech_text_buffer.append',
+      event_id: eventId(),
+      speech_id: speechId,
+      text: text.substring(0, split)
+    });
+    send({
+      type: 'speech_text_buffer.commit',
+      event_id: eventId(),
+      speech_id: speechId,
+      text: text.substring(split)
+    });
+    log('sent greeting', 'dim');
+  }
+
+  function makeSpeechFrame() {
+    var samples = 320; // 20 ms @ 16 kHz
+    var buffer = new ArrayBuffer(samples * 2);
+    var view = new DataView(buffer);
+    for (var i = 0; i < samples; i++) {
+      var t = i / 16000;
+      var value = Math.sin(2 * Math.PI * 220 * t) * 2600 +
+                  Math.sin(2 * Math.PI * 440 * t) * 1200;
+      view.setInt16(i * 2, Math.round(value), true);
+    }
+    return buffer;
+  }
+
+  function bufferToBase64(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = '';
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  function sendFrameAt(index, total, silent, done) {
+    if (!ws || ws.readyState !== 1) { done(); return; }
+    var buffer;
+    if (silent) {
+      buffer = new ArrayBuffer(640);
+    } else {
+      buffer = makeSpeechFrame();
+    }
+    send({ type: 'input_audio_buffer.append', audio: bufferToBase64(buffer) });
+    if (index + 1 >= total) {
+      done();
+      return;
+    }
+    setTimeout(function () { sendFrameAt(index + 1, total, silent, done); }, 20);
+  }
+
+  function simulateSpeech() {
+    if (!sessionReady || sendingSpeech) return;
+    sendingSpeech = true;
+    updateButtons();
+    log('sending 1.0 s speech + 0.8 s silence', 'dim');
+    sendFrameAt(0, 50, false, function () {
+      sendFrameAt(0, 40, true, function () {
+        sendingSpeech = false;
+        log('speech frames sent', 'dim');
+        updateButtons();
+      });
+    });
+  }
+
+  function cancel() {
+    if (!sessionReady) return;
+    send({ type: 'response.cancel', event_id: eventId() });
+    log('sent response.cancel', 'err');
+  }
+
+  function closeSession() {
+    if (!ws) return;
+    if (sessionReady) send({ type: 'session.close', event_id: eventId() });
+    stopAudio();
+    setTimeout(function () {
+      if (ws) {
+        try { ws.close(1000, 'bye'); } catch (e) {}
+      }
+    }, 500);
+  }
+
+  function updateButtons() {
+    var connected = !!ws && ws.readyState === 1;
+    $('connect').disabled = connected;
+    $('greet').disabled = !sessionReady;
+    $('speak').disabled = !sessionReady || sendingSpeech;
+    $('cancel').disabled = !sessionReady;
+    $('close').disabled = !connected;
+  }
+
+  $('url').value = defaultWsUrl();
+  $('token').value = tokenFromHash();
+  $('asr').value = asrFromQuery();
+  $('connect').onclick = connect;
+  $('greet').onclick = greeting;
+  $('speak').onclick = simulateSpeech;
+  $('cancel').onclick = cancel;
+  $('close').onclick = closeSession;
+  updateButtons();
+  log('ready', 'dim');
+})();
+</script>
+</body>
+</html>

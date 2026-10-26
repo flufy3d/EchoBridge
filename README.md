@@ -4,7 +4,7 @@
 
 A lightweight, model-agnostic voice gateway that connects streaming ASR, LLM, and TTS services through a unified Realtime API.
 
-> 🚧 **Status: early development.** This repository is currently a placeholder. Code, docs, and deployment examples are on the way.
+> 🚧 **Status: Phase 1.** The Doubao-compatible WebSocket gateway, mock ASR/LLM/TTS, protocol tests, and an X10A device probe are implemented. See [`docs/PHASE1.md`](docs/PHASE1.md) for run and test instructions; local ASR/TTS/DeepSeek land in Phases 2–4.
 
 ---
 
