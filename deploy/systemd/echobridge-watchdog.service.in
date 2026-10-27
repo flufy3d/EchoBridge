@@ -1,0 +1,13 @@
+[Unit]
+Description=EchoBridge health watchdog
+Documentation=file://@ROOT@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Environment=HOME=@HOME@
+Environment=ECHOBRIDGE_WATCHDOG_MODE=@MODE@
+EnvironmentFile=-@ENV_FILE@
+ExecStart=/bin/bash @ROOT@/deploy/watchdog.sh

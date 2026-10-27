@@ -1,0 +1,24 @@
+[Unit]
+Description=EchoBridge ASR worker (Qwen3-ASR)
+Documentation=file://@ROOT@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@ROOT@
+Environment=HOME=@HOME@
+Environment=PYTHONPATH=@ROOT@/src
+EnvironmentFile=@ENV_FILE@
+ExecStart=/bin/bash @ROOT@/scripts/asr_worker.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=@WANTED_BY@

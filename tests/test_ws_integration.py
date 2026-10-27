@@ -58,7 +58,18 @@ async def test_health_and_probe():
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
             health = await client.get("/healthz")
             assert health.status_code == 200
-            assert health.json()["ok"] is True
+            payload = health.json()
+            assert payload["ok"] is True
+            assert payload["service"] == "echobridge-gateway"
+            assert payload["uptime_s"] >= 0
+            assert "backend" not in payload
+            ready = await client.get("/readyz")
+            assert ready.status_code == 200
+            assert ready.json()["ok"] is True
+            metrics = await client.get("/metrics")
+            assert metrics.status_code == 200
+            assert "echobridge_up 1" in metrics.text
+            assert "echobridge_active_session 0" in metrics.text
             probe = await client.get("/probe")
             assert probe.status_code == 200
             assert "EchoBridge Phase 1 Probe" in probe.text

@@ -2,7 +2,7 @@
 
 > 目标：把明月 Live（X10A）的豆包端到端实时语音替换为「本地 ASR + DeepSeek + 本地 TTS」的自托管网关，同时保持设备端豆包 Realtime 协议子集兼容，并保留豆包后端与自动回退。
 >
-> 状态：Phase 5 真机验收完成（VoiceClient 双后端、auto 回退、设置页、backchannel、10 次切换、视觉/工具/休眠/打断）；Windows Tailscale Serve 的 WSS 鉴权留待 Phase 6 在原生 Ubuntu 复测。Phase 0–4 结果见 `docs/PHASE1.md`–`docs/PHASE4.md`，Phase 5 见 `docs/PHASE5.md`。本文定义协议、边界、验收和阶段计划。
+> 状态：Phase 6 收尾完成（2026-10-27）：WSL2 systemd 用户服务 + Windows 登录任务、Tailscale Serve WSS、watchdog、健康/就绪/指标、30 轮真机/主机基准与验收记录。1 h/24 h 长稳与设备侧正式答复长尾列为明确豁免，按日常使用继续观察。Phase 0–5 结果见 `docs/PHASE1.md`–`docs/PHASE5.md`，Phase 6 见 `docs/DEPLOY.md`、`docs/BENCHMARK.md`、`docs/ACCEPTANCE.md`。本文定义协议、边界、验收和阶段计划。
 >
 > 基线仓库：`E:\Projects\EchoBridge`（空仓库，仅 README）、`E:\Projects\mingyue-live`（M6，App 0.6.0）。
 
@@ -696,6 +696,7 @@ voice.echobridge.localVoiceId = mingyue_v1
 - 1 h/24 h 稳定性；A/B 30 条语音；输出 `docs/BENCHMARK.md` 和真机验收记录。
 - 退出标准：所有 §10 指标达标或有明确豁免；EchoBridge 挂掉可回退；无公网暴露。
 - 提交：`phase 6: deployment + benchmark`。
+- **完成**：WSL2 `systemctl --user` + Windows 登录任务；`/healthz` `/readyz` `/metrics`；30 s watchdog；Tailscale Serve 8443 tailnet-only；30/30 轮基准；ASR/TTS/长稳/设备正式答复长尾豁免记录在 `docs/BENCHMARK.md`。
 
 ---
 

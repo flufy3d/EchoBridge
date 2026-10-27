@@ -1,6 +1,6 @@
 # Phase 5：设备端双后端 + 回退 + 自然 backchannel
 
-状态：**主机 + 真机验收完成；WSS 经 Windows Tailscale Serve 已验证（2026-10-27）；除 Phase 6 的 1h/24h 与生产部署**
+状态：**主机 + 真机验收完成；WSS 经 Windows Tailscale Serve 已验证（2026-10-27）；Phase 6 已完成部署与短基准，1 h/24 h 长稳豁免见 `docs/BENCHMARK.md` 与 `docs/ACCEPTANCE.md`**
 日期：2026-10-27
 范围：VoiceClient 接口、Doubao/EchoBridge 双后端、独立配置、自动回退、设置页、试听、10 次切换验收、智能 backchannel。
 

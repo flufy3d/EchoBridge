@@ -1,0 +1,26 @@
+[Unit]
+Description=EchoBridge TTS worker (Qwen3-TTS via vLLM-Omni)
+Documentation=file://@ROOT@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@ROOT@
+Environment=HOME=@HOME@
+Environment=PYTHONPATH=@ROOT@/src
+EnvironmentFile=@ENV_FILE@
+ExecStart=/bin/bash @ROOT@/scripts/tts_vllm.sh
+Restart=always
+RestartSec=8
+TimeoutStopSec=45
+KillMode=control-group
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=@WANTED_BY@

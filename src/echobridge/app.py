@@ -1,13 +1,16 @@
-"""FastAPI/uvicorn application for the Phase 1 gateway."""
+"""FastAPI/uvicorn application for the EchoBridge gateway."""
 
 from __future__ import annotations
 
 import hmac
+import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import __version__
 from .asr import make_asr
@@ -20,6 +23,73 @@ from .vad import make_vad
 logger = get_logger("echobridge.app")
 
 _PROBE_FILE = Path(__file__).parent / "static" / "probe.html"
+_STARTED_AT = time.monotonic()
+
+
+def _rss_mb() -> float:
+    """Resident set size without adding a psutil dependency."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024.0, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+async def _worker_health(settings: Settings) -> dict[str, dict[str, object]]:
+    """Probe configured local workers for the readiness endpoint.
+
+    The gateway deliberately starts even when a worker is still loading; the
+    watchdog uses this endpoint to wait for (or restart) the full pipeline
+    instead of treating a cold model as a dead gateway.
+    """
+    probes: dict[str, tuple[str, str]] = {}
+    if settings.asr_backend == "qwen3":
+        probes["asr"] = (settings.asr_url + "/healthz", "ok")
+    if settings.tts_backend == "vllm":
+        probes["tts"] = (settings.tts_url + "/health", "status")
+    elif settings.tts_backend == "qwen3":
+        probes["tts"] = (settings.tts_url + "/healthz", "ok")
+
+    results: dict[str, dict[str, object]] = {}
+    if not probes:
+        return results
+    async with httpx.AsyncClient(timeout=httpx.Timeout(1.5, connect=0.5)) as client:
+        for name, (url, field) in probes.items():
+            started = time.perf_counter()
+            try:
+                response = await client.get(url)
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                healthy = response.status_code == 200
+                detail: object = None
+                if healthy:
+                    try:
+                        payload = response.json()
+                        detail = payload.get(field)
+                        healthy = bool(detail) if field == "ok" else detail in {
+                            "healthy",
+                            "ok",
+                            True,
+                        }
+                    except ValueError:
+                        detail = None
+                results[name] = {
+                    "ok": healthy,
+                    "url": url,
+                    "status_code": response.status_code,
+                    "latency_ms": round(latency_ms, 1),
+                    "detail": detail,
+                }
+            except Exception as exc:  # noqa: BLE001 - readiness must never raise
+                results[name] = {
+                    "ok": False,
+                    "url": url,
+                    "error": type(exc).__name__,
+                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 1),
+                }
+    return results
 
 
 def _extract_token(ws: WebSocket) -> str:
@@ -113,8 +183,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             {
                 "ok": True,
+                "service": "echobridge-gateway",
                 "version": __version__,
-                "backend": "mock",
+                "pid": os.getpid(),
+                "uptime_s": round(time.monotonic() - _STARTED_AT, 1),
+                "rss_mb": _rss_mb(),
                 "vad": settings.vad_backend,
                 "asr": settings.asr_backend,
                 "tts": settings.tts_backend,
@@ -130,6 +203,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         )
 
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        workers = await _worker_health(settings)
+        ok = all(bool(item.get("ok")) for item in workers.values())
+        payload = {
+            "ok": ok,
+            "service": "echobridge-gateway",
+            "version": __version__,
+            "uptime_s": round(time.monotonic() - _STARTED_AT, 1),
+            "workers": workers,
+        }
+        return JSONResponse(payload, status_code=200 if ok else 503)
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def metrics() -> str:
+        active = 0 if manager.active is None else 1
+        lines = [
+            "# HELP echobridge_up Gateway process is serving.",
+            "# TYPE echobridge_up gauge",
+            "echobridge_up 1",
+            "# HELP echobridge_uptime_seconds Gateway process uptime.",
+            "# TYPE echobridge_uptime_seconds gauge",
+            f"echobridge_uptime_seconds {time.monotonic() - _STARTED_AT:.1f}",
+            "# HELP echobridge_rss_mb Gateway resident set size.",
+            "# TYPE echobridge_rss_mb gauge",
+            f"echobridge_rss_mb {_rss_mb()}",
+            "# HELP echobridge_active_session Active device session (0/1).",
+            "# TYPE echobridge_active_session gauge",
+            f"echobridge_active_session {active}",
+            "# HELP echobridge_info Static build information.",
+            "# TYPE echobridge_info gauge",
+            f'echobridge_info{{version="{__version__}"}} 1',
+        ]
+        return "\n".join(lines) + "\n"
+
     @app.get("/")
     async def index() -> JSONResponse:
         return JSONResponse(
@@ -138,6 +246,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "version": __version__,
                 "ws": "/echobridge/ws",
                 "health": "/healthz",
+                "ready": "/readyz",
+                "metrics": "/metrics",
                 "probe": "/probe" if settings.enable_probe else None,
             }
         )

@@ -139,6 +139,13 @@ class Qwen3TTSClient:
 
     async def warmup(self) -> None:
         await self._client.get("/healthz")
+        greeting = "你来啦，我在呢。"
+        try:
+            pcm = await self._fetch(greeting, self._voice_id)
+            if pcm:
+                self._backchannel_cache[(self._voice_id, greeting)] = pcm
+        except Exception as exc:
+            logger.warning("TTS greeting prewarm failed: %s", exc)
         for phrase in self._backchannel_phrases:
             try:
                 pcm = await self._fetch(phrase, self._voice_id)
@@ -273,7 +280,11 @@ class VLLMTTSClient:
         # talker/codec path so the first real greeting is cache-hit fast.
         greeting = "你来啦，我在呢。"
         try:
-            await self._prefetch(greeting, self._voice_id)
+            pcm = await self._prefetch(greeting, self._voice_id)
+            if pcm:
+                # Pin the greeting so the 8-entry LRU for real replies cannot
+                # evict it after a few turns.
+                self._backchannel_cache[(self._voice_id, greeting)] = pcm
         except Exception as exc:
             logger.warning("TTS greeting prewarm failed: %s", exc)
         for phrase in self._backchannel_phrases:

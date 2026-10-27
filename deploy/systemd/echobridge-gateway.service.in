@@ -1,0 +1,27 @@
+[Unit]
+Description=EchoBridge realtime voice gateway
+Documentation=file://@ROOT@/docs/DEPLOY.md
+After=network-online.target echobridge-asr.service echobridge-tts.service
+Wants=network-online.target echobridge-asr.service echobridge-tts.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@ROOT@
+Environment=HOME=@HOME@
+Environment=PYTHONPATH=@ROOT@/src
+EnvironmentFile=@ENV_FILE@
+ExecStartPre=/bin/bash @ROOT@/deploy/wait-for-workers.sh
+ExecStart=@PYTHON@ -m echobridge
+Restart=always
+RestartSec=2
+TimeoutStartSec=360
+TimeoutStopSec=25
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=@WANTED_BY@
