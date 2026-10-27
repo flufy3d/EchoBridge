@@ -44,7 +44,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     manager = SessionManager()
     shared_vad = make_vad(settings)
     shared_asr = make_asr(settings) if settings.asr_backend == "qwen3" else None
-    shared_tts = make_tts(settings) if settings.tts_backend == "qwen3" else None
+    # Keep one TTS client for the whole gateway: its cache holds the fixed
+    # greeting and the backchannel fillers warmed at startup.  Previously only
+    # the HF qwen3 backend was shared; vLLM sessions each rebuilt an empty
+    # cache, which made "prewarmed" greetings and backchannels ineffective.
+    shared_tts = make_tts(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):

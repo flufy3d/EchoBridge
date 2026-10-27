@@ -28,6 +28,8 @@ class TTSBackend(Protocol):
         self, text: str, voice_id: str, generation: int
     ) -> AsyncIterator[bytes]: ...
 
+    def cached(self, text: str, voice_id: str) -> bytes | None: ...
+
     async def warmup(self) -> None: ...
 
     async def close(self) -> None: ...
@@ -63,6 +65,16 @@ class MockTTS:
             if chunk:
                 yield chunk
 
+    def cached(self, text: str, voice_id: str) -> bytes | None:
+        if not text.strip():
+            return None
+        # Mock TTS has no model latency; synthesizing a short filler is cheap.
+        return tone_pcm16(
+            text,
+            sample_rate=24_000,
+            char_ms=self._settings.tts_tone_char_ms,
+        )
+
     async def warmup(self) -> None:
         return None
 
@@ -75,12 +87,41 @@ class Qwen3TTSClient:
 
     def __init__(self, settings: Settings) -> None:
         self._voice_id = settings.tts_voice_id
+        self._backchannel_phrases = (
+            settings.backchannel_phrases if settings.backchannel_enabled else ()
+        )
         self._client = httpx.AsyncClient(
             base_url=settings.tts_url,
             timeout=httpx.Timeout(settings.tts_timeout_s, connect=2.0),
         )
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        self._backchannel_cache: dict[tuple[str, str], bytes] = {}
         self._cache_max = 8
+
+    def cached(self, text: str, voice_id: str) -> bytes | None:
+        key = (voice_id or self._voice_id, text.strip())
+        pinned = self._backchannel_cache.get(key)
+        return pinned if pinned is not None else self._cache.get(key)
+
+    async def _fetch(self, text: str, voice: str, generation: int = 0) -> bytes:
+        key = (voice, text)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
+        response = await self._client.post(
+            "/v1/synthesize",
+            json={"text": text, "voice_id": voice, "generation": generation},
+        )
+        response.raise_for_status()
+        pcm = response.content
+        if not pcm:
+            raise RuntimeError("TTS worker returned empty audio")
+        self._cache[key] = pcm
+        self._cache.move_to_end(key)
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+        return pcm
 
     async def synthesize(
         self, text: str, voice_id: str, generation: int
@@ -89,24 +130,7 @@ class Qwen3TTSClient:
         if not text:
             return
         voice = voice_id or self._voice_id
-        key = (voice, text)
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            pcm = cached
-        else:
-            response = await self._client.post(
-                "/v1/synthesize",
-                json={"text": text, "voice_id": voice, "generation": generation},
-            )
-            response.raise_for_status()
-            pcm = response.content
-            if not pcm:
-                raise RuntimeError("TTS worker returned empty audio")
-            self._cache[key] = pcm
-            self._cache.move_to_end(key)
-            while len(self._cache) > self._cache_max:
-                self._cache.popitem(last=False)
+        pcm = await self._fetch(text, voice, generation)
         block = 4_800  # 100 ms @ 24 kHz
         for offset in range(0, len(pcm), block):
             chunk = pcm[offset : offset + block]
@@ -115,6 +139,13 @@ class Qwen3TTSClient:
 
     async def warmup(self) -> None:
         await self._client.get("/healthz")
+        for phrase in self._backchannel_phrases:
+            try:
+                pcm = await self._fetch(phrase, self._voice_id)
+                if pcm:
+                    self._backchannel_cache[(self._voice_id, phrase)] = pcm
+            except Exception as exc:
+                logger.warning("TTS backchannel prewarm failed phrase=%r: %s", phrase, exc)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -130,6 +161,9 @@ class VLLMTTSClient:
 
     def __init__(self, settings: Settings) -> None:
         self._voice_id = settings.tts_voice_id
+        self._backchannel_phrases = (
+            settings.backchannel_phrases if settings.backchannel_enabled else ()
+        )
         ref_audio = Path(os.path.expanduser(settings.tts_ref_audio))
         ref_text = Path(os.path.expanduser(settings.tts_ref_text))
         if not ref_audio.exists():
@@ -149,6 +183,7 @@ class VLLMTTSClient:
         )
         self._api_key = settings.tts_api_key
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+        self._backchannel_cache: dict[tuple[str, str], bytes] = {}
         self._cache_max = 8
 
     def _payload(self, text: str, voice: str) -> dict:
@@ -207,6 +242,28 @@ class VLLMTTSClient:
             while len(self._cache) > self._cache_max:
                 self._cache.popitem(last=False)
 
+    def cached(self, text: str, voice_id: str) -> bytes | None:
+        key = (voice_id or self._voice_id, text.strip())
+        pinned = self._backchannel_cache.get(key)
+        return pinned if pinned is not None else self._cache.get(key)
+
+    async def _prefetch(self, text: str, voice: str) -> bytes:
+        key = (voice, text)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            return cached
+        collected = bytearray()
+        async for chunk in self._stream(text, voice):
+            collected.extend(chunk)
+        pcm = bytes(collected)
+        if pcm:
+            self._cache[key] = pcm
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
+        return pcm
+
     async def warmup(self) -> None:
         try:
             await self._client.get("/health")
@@ -215,13 +272,17 @@ class VLLMTTSClient:
         # Pre-synthesize the fixed app greeting; this is silent and warms the
         # talker/codec path so the first real greeting is cache-hit fast.
         greeting = "你来啦，我在呢。"
-        key = (self._voice_id, greeting)
-        if key not in self._cache:
-            collected = bytearray()
-            async for chunk in self._stream(greeting, self._voice_id):
-                collected.extend(chunk)
-            if collected:
-                self._cache[key] = bytes(collected)
+        try:
+            await self._prefetch(greeting, self._voice_id)
+        except Exception as exc:
+            logger.warning("TTS greeting prewarm failed: %s", exc)
+        for phrase in self._backchannel_phrases:
+            try:
+                pcm = await self._prefetch(phrase, self._voice_id)
+                if pcm:
+                    self._backchannel_cache[(self._voice_id, phrase)] = pcm
+            except Exception as exc:
+                logger.warning("TTS backchannel prewarm failed phrase=%r: %s", phrase, exc)
 
     async def close(self) -> None:
         await self._client.aclose()

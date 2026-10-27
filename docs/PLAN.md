@@ -2,7 +2,7 @@
 
 > 目标：把明月 Live（X10A）的豆包端到端实时语音替换为「本地 ASR + DeepSeek + 本地 TTS」的自托管网关，同时保持设备端豆包 Realtime 协议子集兼容，并保留豆包后端与自动回退。
 >
-> 状态：Phase 4 完成（主机侧；首音 p50 1.84 s 未达 1.5 s，主观音色/10 分钟试听待用户，X10A 实录音/远场 WER 待补）。Phase 0–4 结果见 `docs/PHASE1.md`–`docs/PHASE4.md`。本文定义协议、边界、验收和阶段计划。
+> 状态：Phase 5 真机验收完成（VoiceClient 双后端、auto 回退、设置页、backchannel、10 次切换、视觉/工具/休眠/打断）；Windows Tailscale Serve 的 WSS 鉴权留待 Phase 6 在原生 Ubuntu 复测。Phase 0–4 结果见 `docs/PHASE1.md`–`docs/PHASE4.md`，Phase 5 见 `docs/PHASE5.md`。本文定义协议、边界、验收和阶段计划。
 >
 > 基线仓库：`E:\Projects\EchoBridge`（空仓库，仅 README）、`E:\Projects\mingyue-live`（M6，App 0.6.0）。
 
@@ -179,6 +179,7 @@ App 只读这些字段；额外字段会被忽略。
 | `response.function_call_arguments.done` | `items[]`：`call_id`（回退 `id`）、`name`、`arguments` | THINKING；并行执行工具；把所有结果合并成一个 `conversation.item.create` | 多个调用必须放同一个 `items` 数组一次性发 |
 | `response.done` | 无 | 清抑制；有 pending tool → THINKING；否则 LISTENING | 必须在 audio.done 之后；每个 response 恰好一次 |
 | `response.canceled` | 无 | flush 播放；清 reply/pending tools；LISTENING | 收到 cancel 后 <300 ms 发；此后不得再发旧 generation 音频 |
+| `response.backchannel` | `response_id`/`sound_id`/`delta`/`format` | 独立 AudioTrack 播放“嗯～”；正式音频 started 时 120 ms 淡出 | 仅 EchoBridge；独立于正式 response/pacer，每轮最多 1 条；不参与 text/audio 状态机 |
 | `error` | `error.message`，回退 `error.toString()`，再回退顶层 `message` | **终止会话**：ERROR、关 socket、上层重试 | 只用于致命错误；不要用 error 表达“没听清” |
 | `session.closed` | 无 | 关 socket、IDLE | 关闭前发；`disconnect()` 最多等 1 s |
 

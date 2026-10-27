@@ -7,6 +7,7 @@ where wire-format decisions live.
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,6 +45,7 @@ AUDIO_DONE = "response.output_audio.done"
 TOOL_CALL_DONE = "response.function_call_arguments.done"
 RESPONSE_DONE = "response.done"
 RESPONSE_CANCELED = "response.canceled"
+BACKCHANNEL = "response.backchannel"
 ERROR = "error"
 
 
@@ -184,6 +186,21 @@ def response_done(ctx: ResponseContext, status: str = "completed") -> dict[str, 
 
 def response_canceled(ctx: ResponseContext) -> dict[str, Any]:
     return {"type": RESPONSE_CANCELED, **_response_header(ctx)}
+
+
+def backchannel(ctx: ResponseContext, sound_id: str, pcm: bytes, rate: int = 24_000) -> dict[str, Any]:
+    """A short, separate filler clip.  It is not part of the formal response.
+
+    The app plays it on a dedicated track and fades it out as soon as formal
+    ``response.output_audio.started`` arrives, so it never delays the answer.
+    """
+    return {
+        "type": BACKCHANNEL,
+        **_response_header(ctx),
+        "sound_id": sound_id,
+        "format": {"type": "pcm_s16le", "rate": rate},
+        "delta": base64.b64encode(pcm).decode("ascii"),
+    }
 
 
 def error(message: str, code: str = "gateway_error", fatal: bool = True) -> dict[str, Any]:

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import random
 import time
 import uuid
 from typing import Any, Protocol
@@ -26,7 +27,7 @@ from .llm import MockLLM
 from .llm_deepseek import DeepSeekLLM, build_system_prompt
 from .logging import get_logger
 from .pacer import AudioPacer
-from .text import split_for_tts
+from .text import is_stop_command, split_for_tts
 from .tools import available_tool_names, convert_tools
 from .tts import TTSBackend
 from .vad import VADBackend, VADEvent, make_vad
@@ -85,6 +86,12 @@ class Session:
         self._speech_buffers: dict[str, str] = {}
         self._spec_task: asyncio.Task | None = None
         self._spec_item = ""
+        self._backchannel_task: asyncio.Task[None] | None = None
+        self._last_backchannel = ""
+        self._backchannel_sent_this_turn = False
+        self._turn_started_at: float | None = None
+        self._first_audio_generation = 0
+        self._backchannel_sent_generation = 0
         self._llm = MockLLM(settings.llm_char_delay_ms)
         self._deepseek = DeepSeekLLM(settings) if settings.llm_backend == "deepseek" else None
         from .tts import make_tts
@@ -282,6 +289,17 @@ class Session:
             await self._send(
                 protocol.asr_completed(event.item_id, text, result.language or "zh")
             )
+            if is_stop_command(text):
+                # A barge-in "停一下/不用了" must stop the old answer without
+                # turning the stop phrase into a brand-new LLM turn.
+                logger.info(
+                    "stop command item=%s chars=%d", event.item_id, len(text)
+                )
+                ctx = self._begin_response()
+                self._turn_started_at = None
+                await self._send(protocol.response_done(ctx, "stopped"), ctx=ctx)
+                self._finish_response(ctx)
+                return
             await self._start_turn(text)
 
     async def _handle_speech(self, event: dict[str, Any]) -> None:
@@ -355,19 +373,100 @@ class Session:
     async def _start_turn(self, transcript: str) -> None:
         if self._response_active:
             await self._cancel_active(send_canceled=True, reason="new_turn")
+        self._turn_started_at = time.perf_counter()
+        self._backchannel_sent_this_turn = False
         ctx = self._begin_response()
         self._history.append({"role": "user", "content": transcript})
         self._trim_history()
+        self._schedule_backchannel(ctx)
         runner = self._run_deepseek_turn if self._deepseek is not None else self._run_turn
         self._response_task = asyncio.create_task(
             runner(ctx, transcript), name=f"turn-{ctx.response_id}"
         )
 
     async def _start_greeting(self, text: str) -> None:
+        self._turn_started_at = None
         ctx = self._begin_response()
         self._response_task = asyncio.create_task(
             self._run_greeting(ctx, text), name=f"greeting-{ctx.response_id}"
         )
+
+    def _schedule_backchannel(self, ctx: protocol.ResponseContext) -> None:
+        self._cancel_backchannel()
+        if not self._settings.backchannel_enabled:
+            return
+        if not self._settings.backchannel_phrases:
+            return
+        if self._backchannel_sent_this_turn:
+            return
+        self._backchannel_task = asyncio.create_task(
+            self._run_backchannel(ctx), name=f"backchannel-{ctx.response_id}"
+        )
+        self._backchannel_task.add_done_callback(self._consume_task_exception)
+
+    def _cancel_backchannel(self) -> None:
+        task = self._backchannel_task
+        self._backchannel_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _run_backchannel(self, ctx: protocol.ResponseContext) -> None:
+        try:
+            if self._turn_started_at is None:
+                return
+            delay = max(0, self._settings.backchannel_delay_ms) / 1000.0
+            remaining = self._turn_started_at + delay - time.perf_counter()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if (
+                self._closed
+                or ctx.generation != self._generation
+                or not self._response_active
+            ):
+                return
+            if self._first_audio_generation == ctx.generation:
+                return
+            phrase = self._pick_backchannel()
+            pcm = self._tts.cached(phrase, self._voice)
+            if not pcm:
+                logger.info(
+                    "backchannel cache miss response=%s sound=%s",
+                    ctx.response_id,
+                    phrase,
+                )
+                return
+            # Re-check after the (sync) cache lookup.  TTS may have produced
+            # its first chunk while this task was scheduled.
+            if self._first_audio_generation == ctx.generation:
+                return
+            elapsed_ms = (
+                (time.perf_counter() - self._turn_started_at) * 1000.0
+                if self._turn_started_at is not None
+                else -1.0
+            )
+            if await self._send(protocol.backchannel(ctx, phrase, pcm), ctx=ctx):
+                self._backchannel_sent_generation = ctx.generation
+                self._backchannel_sent_this_turn = True
+                self._last_backchannel = phrase
+                logger.info(
+                    "backchannel sent response=%s sound=%s after_asr_ms=%.1f bytes=%d",
+                    ctx.response_id,
+                    phrase,
+                    elapsed_ms,
+                    len(pcm),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("backchannel failed response=%s", ctx.response_id)
+
+    def _pick_backchannel(self) -> str:
+        phrases = [
+            p for p in self._settings.backchannel_phrases if p != self._last_backchannel
+        ]
+        if not phrases:
+            phrases = list(self._settings.backchannel_phrases)
+        return random.choice(phrases)
 
     def _begin_response(self) -> protocol.ResponseContext:
         self._generation += 1
@@ -558,6 +657,7 @@ class Session:
                     self._trim_history()
                     await self._send(protocol.response_done(ctx, "tool_calls"), ctx=ctx)
                     ctx = self._begin_response()
+                    self._schedule_backchannel(ctx)
                     continue
                 if text:
                     self._history.append({"role": "assistant", "content": text})
@@ -585,9 +685,26 @@ class Session:
     async def _synthesize_into(
         self, pacer: AudioPacer, text: str, ctx: protocol.ResponseContext
     ) -> None:
+        first_pcm = True
         for chunk in split_for_tts(text) or [text]:
             async for pcm in self._tts.synthesize(chunk, self._voice, ctx.generation):
+                if first_pcm:
+                    first_pcm = False
+                    if self._first_audio_generation != ctx.generation:
+                        self._first_audio_generation = ctx.generation
+                        self._log_first_audio(ctx)
                 await pacer.feed(pcm)
+
+    def _log_first_audio(self, ctx: protocol.ResponseContext) -> None:
+        if self._turn_started_at is None:
+            return
+        elapsed_ms = (time.perf_counter() - self._turn_started_at) * 1000.0
+        logger.info(
+            "tts first chunk formal response=%s after_asr_ms=%.1f backchannel=%s",
+            ctx.response_id,
+            elapsed_ms,
+            "1" if self._backchannel_sent_generation == ctx.generation else "0",
+        )
 
     @staticmethod
     def _should_flush(buffer: str, limit: int) -> bool:
@@ -599,6 +716,8 @@ class Session:
 
     async def _cancel_active(self, *, send_canceled: bool, reason: str) -> None:
         self._discard_speculative_asr()
+        self._cancel_backchannel()
+        self._turn_started_at = None
         old = self._active_ctx
         if old is None and not self._response_active:
             return
@@ -631,6 +750,8 @@ class Session:
             await self._send(protocol.response_canceled(old), force=True)
 
     def _finish_response(self, ctx: protocol.ResponseContext) -> None:
+        self._cancel_backchannel()
+        self._turn_started_at = None
         if self._active_ctx is not ctx:
             return
         if ctx.generation == self._generation and not ctx.done:

@@ -27,6 +27,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_phrases(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    phrases = tuple(part.strip() for part in raw.split("|") if part.strip())
+    return phrases or default
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     bind: str = "127.0.0.1"
@@ -76,6 +84,13 @@ class Settings:
     tts_tone_char_ms: int = 55
     mock_tts_wav: str | None = None
     tool_timeout_s: float = 25.0
+
+    # Natural backchannel ("嗯～") played when the real answer is slow.  It is
+    # cached at TTS warmup and sent as a separate response.backchannel event so
+    # it never shares the formal response's pacer/queue.
+    backchannel_enabled: bool = True
+    backchannel_delay_ms: int = 700
+    backchannel_phrases: tuple[str, ...] = ("嗯～", "唔～", "我想想～")
 
     # Dev-only probe page (static HTML; no secrets).
     enable_probe: bool = True
@@ -144,6 +159,12 @@ class Settings:
             tts_tone_char_ms=_env_int("ECHOBRIDGE_TTS_TONE_CHAR_MS", 55),
             mock_tts_wav=os.environ.get("ECHOBRIDGE_MOCK_TTS_WAV") or None,
             tool_timeout_s=float(os.environ.get("ECHOBRIDGE_TOOL_TIMEOUT_S", "25")),
+            backchannel_enabled=_env_bool("ECHOBRIDGE_BACKCHANNEL_ENABLED", True),
+            backchannel_delay_ms=_env_int("ECHOBRIDGE_BACKCHANNEL_DELAY_MS", 700),
+            backchannel_phrases=_env_phrases(
+                "ECHOBRIDGE_BACKCHANNEL_PHRASES",
+                ("嗯～", "唔～", "我想想～"),
+            ),
             enable_probe=_env_bool("ECHOBRIDGE_ENABLE_PROBE", True),
             log_level=os.environ.get("ECHOBRIDGE_LOG_LEVEL", "INFO").upper(),
         )
