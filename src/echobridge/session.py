@@ -21,7 +21,7 @@ import uuid
 from typing import Any, Protocol
 
 from . import protocol
-from .asr import ASRBackend, MockASR
+from .asr import ASRBackend, MockASR, is_hotword_echo
 from .config import Settings
 from .llm import MockLLM
 from .llm_deepseek import DeepSeekLLM, build_system_prompt
@@ -275,6 +275,14 @@ class Session:
             asr_wall_ms = (time.perf_counter() - asr_started) * 1000.0
             text = (result.text or "").strip()
             if not text:
+                await self._send(protocol.asr_failed(event.item_id, "empty speech"))
+                return
+            if is_hotword_echo(text, self._settings.asr_hotwords):
+                logger.warning(
+                    "discarding ASR hotword echo item=%s chars=%d",
+                    event.item_id,
+                    len(text),
+                )
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
             logger.info(

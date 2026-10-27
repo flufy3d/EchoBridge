@@ -60,6 +60,10 @@ class Settings:
     asr_url: str = "http://127.0.0.1:18801"
     asr_timeout_s: float = 8.0
     mock_asr_text: str = "你好呀，溟月"
+    # Qwen3-ASR context biasing.  This is *not* a weighted hotword table: the
+    # terms are injected as the request context/system prompt, so keep the list
+    # short and verify with real recordings.
+    asr_hotwords: tuple[str, ...] = ()
 
     tts_backend: str = "mock"
     tts_url: str = "http://127.0.0.1:18802"
@@ -96,6 +100,19 @@ class Settings:
     enable_probe: bool = True
     log_level: str = "INFO"
 
+    @property
+    def asr_context(self) -> str:
+        """Context string sent to Qwen3-ASR for contextual biasing.
+
+        The open-source Qwen3-ASR package has no weighted vocabulary table;
+        ``context`` is a free-form prompt.  A short "Technical terms:" prefix
+        works better than a bare list in practice.
+        """
+        terms = tuple(term.strip() for term in self.asr_hotwords if term.strip())
+        if not terms:
+            return ""
+        return "Technical terms: " + ", ".join(terms)
+
     @classmethod
     def from_env(cls) -> "Settings":
         dev = _env_bool("ECHOBRIDGE_DEV", True)
@@ -127,6 +144,7 @@ class Settings:
             asr_url=os.environ.get("ECHOBRIDGE_ASR_URL", "http://127.0.0.1:18801").rstrip("/"),
             asr_timeout_s=float(os.environ.get("ECHOBRIDGE_ASR_TIMEOUT_S", "8")),
             mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀，溟月"),
+            asr_hotwords=_env_phrases("ECHOBRIDGE_ASR_HOTWORDS", ()),
             tts_backend=os.environ.get("ECHOBRIDGE_TTS_BACKEND", "mock").strip().lower(),
             tts_url=os.environ.get("ECHOBRIDGE_TTS_URL", "http://127.0.0.1:18802").rstrip("/"),
             tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),

@@ -11,6 +11,9 @@ not collide.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import inspect
 import os
 import time
 from contextlib import asynccontextmanager
@@ -30,15 +33,18 @@ LANGUAGE = os.environ.get("ECHOBRIDGE_ASR_LANGUAGE", "").strip() or None
 MAX_NEW_TOKENS = int(os.environ.get("ECHOBRIDGE_ASR_MAX_NEW_TOKENS", "192"))
 HOST = os.environ.get("ECHOBRIDGE_ASR_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ECHOBRIDGE_ASR_PORT", "18801"))
+CONTEXT_MAX_CHARS = 400
 
 _model = None
 _load_error = ""
 _lock = asyncio.Lock()
 _loaded_at = 0.0
+_supports_context: bool | None = None
+_context_warned = False
 
 
 def _load_model():
-    global _model, _load_error, _loaded_at
+    global _model, _load_error, _loaded_at, _supports_context
     if _model is not None:
         return
     from qwen_asr import Qwen3ASRModel
@@ -53,6 +59,10 @@ def _load_model():
         # FlashAttention-2 is optional; SDPA is the portable default.
         # attn_implementation="flash_attention_2",
     )
+    try:
+        _supports_context = "context" in inspect.signature(_model.transcribe).parameters
+    except (TypeError, ValueError):
+        _supports_context = False
     _loaded_at = time.perf_counter() - started
     _load_error = ""
     # Warm up kernels and the audio frontend.  This is not user audio.
@@ -61,19 +71,30 @@ def _load_model():
     torch.cuda.synchronize()
     print(
         f"asr model loaded path={MODEL_PATH} load_s={_loaded_at:.2f} "
-        f"vram_mb={torch.cuda.memory_allocated() / 1024 / 1024:.1f}",
+        f"vram_mb={torch.cuda.memory_allocated() / 1024 / 1024:.1f} "
+        f"context={_supports_context}",
         flush=True,
     )
 
 
-def _transcribe(pcm: bytes, sample_rate: int) -> dict:
+def _transcribe(pcm: bytes, sample_rate: int, context: str = "") -> dict:
+    global _context_warned
     if _model is None:
         raise RuntimeError(_load_error or "model not loaded")
     if sample_rate != 16000:
         raise ValueError("only 16 kHz input is supported")
     audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     started = time.perf_counter()
-    results = _model.transcribe(audio=(audio, sample_rate), language=LANGUAGE)
+    kwargs = {}
+    if context and _supports_context:
+        kwargs["context"] = context
+    elif context and not _context_warned:
+        print(
+            "asr context ignored: installed qwen-asr has no context parameter",
+            flush=True,
+        )
+        _context_warned = True
+    results = _model.transcribe(audio=(audio, sample_rate), language=LANGUAGE, **kwargs)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if not results:
@@ -100,6 +121,18 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="EchoBridge ASR Worker", lifespan=lifespan)
 
 
+def _read_context(request: Request) -> str:
+    """Decode the optional UTF-8 context sent by the gateway as base64."""
+    raw = request.headers.get("x-asr-context", "").strip()
+    if not raw:
+        return ""
+    try:
+        return base64.b64decode(raw, validate=True).decode("utf-8")[:CONTEXT_MAX_CHARS]
+    except (binascii.Error, UnicodeDecodeError):
+        print("asr context header ignored: invalid base64/utf-8", flush=True)
+        return ""
+
+
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
     return JSONResponse(
@@ -111,6 +144,8 @@ async def healthz() -> JSONResponse:
             "load_s": round(_loaded_at, 2),
             "language": LANGUAGE or "auto",
             "max_new_tokens": MAX_NEW_TOKENS,
+            "supports_context": _supports_context,
+            "context_max_chars": CONTEXT_MAX_CHARS,
             "vram_allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 1)
             if torch.cuda.is_available()
             else 0,
@@ -123,21 +158,22 @@ async def transcribe(request: Request) -> JSONResponse:
     if _model is None:
         raise HTTPException(status_code=503, detail=_load_error or "model not loaded")
     sample_rate = int(request.headers.get("x-sample-rate", "16000"))
+    context = _read_context(request)
     body = await request.body()
     if not body or len(body) % 2:
         raise HTTPException(status_code=400, detail="PCM16 body required")
     async with _lock:
         try:
-            result = await asyncio.to_thread(_transcribe, body, sample_rate)
+            result = await asyncio.to_thread(_transcribe, body, sample_rate, context)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             print(f"asr inference failed: {type(exc).__name__}: {exc}", flush=True)
             raise HTTPException(status_code=500, detail="asr inference failed") from exc
-    # Never log the transcript itself.
+    # Never log the transcript or the hotword list itself.
     print(
         f"asr request bytes={len(body)} latency_ms={result['latency_ms']:.1f} "
-        f"chars={len(result['text'])}",
+        f"chars={len(result['text'])} context_chars={len(context)}",
         flush=True,
     )
     return JSONResponse(result)
