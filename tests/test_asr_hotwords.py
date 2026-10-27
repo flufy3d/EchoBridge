@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 
-from echobridge.asr import encode_asr_context, is_hotword_echo
-from echobridge.config import Settings
+from echobridge.asr import (
+    ASRResult,
+    encode_asr_context,
+    is_hotword_echo,
+    parse_hotwords,
+)
+from echobridge.config import Settings, build_asr_context
+from echobridge.session import Session
+from tests.fakes import FakeWebSocket
+from tests.helpers import loud_frame, make_settings, session_create, silence_frame
 
 HOTWORDS = ("ChatGPT", "Claude", "DeepSeek", "豆包", "溟月", "小鲸鱼", "大肥鱼")
 
@@ -20,6 +29,18 @@ def test_hotwords_build_context(monkeypatch):
 
 def test_no_hotwords_means_no_context():
     assert Settings().asr_context == ""
+    assert build_asr_context([]) == ""
+
+
+def test_session_hotword_parsing_accepts_array_and_delimiters():
+    assert parse_hotwords(["ChatGPT", " 溟月 "]) == ("ChatGPT", "溟月")
+    assert parse_hotwords("ChatGPT,Claude|溟月|小鲸鱼") == (
+        "ChatGPT",
+        "Claude",
+        "溟月",
+        "小鲸鱼",
+    )
+    assert parse_hotwords(None) is None
 
 
 def test_context_header_is_utf8_base64():
@@ -43,3 +64,58 @@ def test_normal_speech_is_not_detected_as_echo():
     assert not is_hotword_echo("溟月，今天天气怎么样", HOTWORDS)
     assert not is_hotword_echo("帮我比较一下 ChatGPT 和 Claude", HOTWORDS)
     assert not is_hotword_echo("小鲸鱼和大肥鱼都在吗", HOTWORDS)
+
+
+class _RecordingASR:
+    def __init__(self) -> None:
+        self.contexts: list[str | None] = []
+
+    async def transcribe(self, pcm, sample_rate=16000, context=None):
+        self.contexts.append(context)
+        return ASRResult("你好呀，溟月", "zh", 0.0)
+
+    async def warmup(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_session_create_hotwords_override_gateway_default():
+    ws = FakeWebSocket()
+    asr = _RecordingASR()
+    session = Session(
+        ws,
+        make_settings(asr_hotwords=("网关默认词",)),
+        device_id="test-device",
+        asr=asr,
+    )
+    task = asyncio.create_task(session.run())
+    try:
+        event = session_create()
+        event["extension"]["asr"]["extra"]["hotwords"] = ["ChatGPT", "溟月"]
+        await ws.push(event)
+        await ws.wait_for_type("session.created")
+
+        for _ in range(30):
+            await ws.push(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(loud_frame()).decode("ascii"),
+                }
+            )
+        for _ in range(35):
+            await ws.push(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(silence_frame()).decode("ascii"),
+                }
+            )
+
+        await ws.wait_for_type(
+            "conversation.item.input_audio_transcription.completed"
+        )
+        assert asr.contexts[-1] == "Technical terms: ChatGPT, 溟月"
+    finally:
+        await session.close("test")
+        await asyncio.wait_for(task, timeout=2)

@@ -21,8 +21,8 @@ import uuid
 from typing import Any, Protocol
 
 from . import protocol
-from .asr import ASRBackend, MockASR, is_hotword_echo
-from .config import Settings
+from .asr import ASRBackend, MockASR, is_hotword_echo, parse_hotwords
+from .config import Settings, build_asr_context
 from .llm import MockLLM
 from .llm_deepseek import DeepSeekLLM, build_system_prompt
 from .logging import get_logger
@@ -73,6 +73,10 @@ class Session:
         self._tools_volc: list[dict[str, Any]] = []
         self._tools_openai: list[dict[str, Any]] = []
         self._tool_names: set[str] = set()
+        # None = use the gateway-wide ECHOBRIDGE_ASR_HOTWORDS; a tuple
+        # (including an empty one) comes from this session's session.create.
+        self._session_hotwords: tuple[str, ...] | None = None
+        self._session_asr_context: str | None = None
 
         self._event_seq = 0
         self._generation = 0
@@ -208,6 +212,7 @@ class Session:
         self._tools_volc = tools if isinstance(tools, list) else []
         self._tools_openai = convert_tools(self._tools_volc)
         self._tool_names = available_tool_names(self._tools_openai)
+        self._apply_asr_extension(event, session)
         self._created = True
         self._vad.reset()
         await self._send(
@@ -224,6 +229,47 @@ class Session:
             self._voice or "-",
             len(self._tools_openai),
             len(self._tools_volc) - len(self._tools_openai),
+        )
+
+    def _apply_asr_extension(
+        self, event: dict[str, Any], session: dict[str, Any]
+    ) -> None:
+        """Read per-session ASR hotwords from session.create.extension.
+
+        The device may put ``extension`` at the top level or inside
+        ``session``.  ``hotwords`` accepts a JSON array or a delimited string;
+        an explicit empty value disables the gateway-wide default for this
+        session.  Doubao's ``boosting_table_id`` is ignored here.
+        """
+        for container in (event, session):
+            extension = container.get("extension")
+            if not isinstance(extension, dict):
+                continue
+            asr = extension.get("asr")
+            if not isinstance(asr, dict):
+                continue
+            extra = asr.get("extra")
+            if not isinstance(extra, dict):
+                continue
+            if "hotwords" in extra:
+                hotwords = parse_hotwords(extra.get("hotwords"))
+                if hotwords is None:
+                    return
+                self._session_hotwords = hotwords
+                self._session_asr_context = build_asr_context(hotwords)
+                return
+            if "context" in extra:
+                context = extra.get("context")
+                if isinstance(context, str):
+                    self._session_hotwords = ()
+                    self._session_asr_context = context.strip()[:400]
+                return
+
+    async def _transcribe_pcm(self, pcm: bytes):
+        if self._session_asr_context is None:
+            return await self._asr.transcribe(pcm, 16000)
+        return await self._asr.transcribe(
+            pcm, 16000, context=self._session_asr_context
         )
 
     async def _handle_audio(self, event: dict[str, Any]) -> None:
@@ -265,7 +311,7 @@ class Session:
             speculative = result is not None
             if result is None:
                 try:
-                    result = await self._asr.transcribe(event.pcm, 16000)
+                    result = await self._transcribe_pcm(event.pcm)
                 except Exception:
                     logger.exception(
                         "asr failed item=%s bytes=%d", event.item_id, len(event.pcm)
@@ -277,7 +323,12 @@ class Session:
             if not text:
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
-            if is_hotword_echo(text, self._settings.asr_hotwords):
+            hotwords = (
+                self._settings.asr_hotwords
+                if self._session_hotwords is None
+                else self._session_hotwords
+            )
+            if is_hotword_echo(text, hotwords):
                 logger.warning(
                     "discarding ASR hotword echo item=%s chars=%d",
                     event.item_id,
@@ -330,7 +381,7 @@ class Session:
         self._spec_item = event.item_id
 
         async def run() -> Any:
-            return await self._asr.transcribe(event.pcm, 16000)
+            return await self._transcribe_pcm(event.pcm)
 
         task = asyncio.create_task(run(), name=f"spec-asr-{event.item_id}")
         self._spec_task = task

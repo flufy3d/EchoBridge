@@ -378,7 +378,7 @@ TOOL_WAIT
 - 目标：端点后 final < 500 ms（P50/P95 都记录）；ASR worker 推理本身目标 < 300 ms（3–5 s 语音）。
 - 可选 delta：v1 默认关闭；若 Phase 2 有余量，可用“每 300–500 ms 对当前缓冲重跑”的伪增量，但不得影响 final 延迟/稳定性。
 - worker API（v1）：`POST /v1/transcribe`，body 为原始 PCM16（`application/octet-stream`）+ header `X-Sample-Rate: 16000`；可选 header `X-ASR-Context: <base64 UTF-8>` 传热词/上下文增强；返回 `{text, language, latency_ms}`。本地 loopback，避免 base64 开销。
-- 热词：`ECHOBRIDGE_ASR_HOTWORDS`（`|` 分隔）由网关拼成 `Technical terms: ...` 后随请求下发。Qwen3-ASR 的 `context` 是 prompt 偏置，不是带权重的热词表，列表要短，需用实录验证；网关对“整张热词表被原样吐出”的幻觉做兜底丢弃。
+- 热词：`ECHOBRIDGE_ASR_HOTWORDS`（`|` 分隔）是网关默认值；App 可在 `session.create.extension.asr.extra.hotwords`（JSON 数组或 `|,，、;；` 分隔字符串）按会话覆盖，空数组显式关闭默认热词。网关拼成 `Technical terms: ...` 后随请求下发。Qwen3-ASR 的 `context` 是 prompt 偏置，不是带权重的热词表，列表要短，需用实录验证；网关对“整张热词表被原样吐出”的幻觉做兜底丢弃。`boosting_table_id` 属于豆包侧，EchoBridge 忽略。
 - 超时：5 s；失败返回 `failed`；worker 挂掉由 gateway health/watchdog 重启。
 - 测试：设备实录安静/电视/远场 1–3 m；记录 WER/CER、端点后延迟；录音不入库/不入 repo。
 

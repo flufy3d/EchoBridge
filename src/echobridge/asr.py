@@ -10,7 +10,7 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -28,6 +28,19 @@ _ECHO_PREFIXES = ("technicalterms", "hotwords", "terms", "专有名词", "热词
 def encode_asr_context(context: str) -> str:
     """Encode a UTF-8 context string for the X-ASR-Context HTTP header."""
     return base64.b64encode(context.encode("utf-8")).decode("ascii")
+
+
+def parse_hotwords(raw: Any) -> tuple[str, ...] | None:
+    """Parse an ASR hotword list from a JSON array or a delimited string."""
+    if isinstance(raw, list):
+        return tuple(str(item).strip() for item in raw if str(item).strip())
+    if isinstance(raw, str):
+        return tuple(
+            part.strip()
+            for part in re.split(r"[|,，、;；\n]+", raw)
+            if part.strip()
+        )
+    return None
 
 
 def _normalize_echo(text: str) -> str:
@@ -63,7 +76,9 @@ class ASRResult:
 
 
 class ASRBackend(Protocol):
-    async def transcribe(self, pcm: bytes, sample_rate: int = 16000) -> ASRResult: ...
+    async def transcribe(
+        self, pcm: bytes, sample_rate: int = 16000, context: str | None = None
+    ) -> ASRResult: ...
 
     async def warmup(self) -> None: ...
 
@@ -74,7 +89,9 @@ class MockASR:
     def __init__(self, text: str) -> None:
         self._text = text.strip()
 
-    async def transcribe(self, pcm: bytes, sample_rate: int = 16000) -> ASRResult:
+    async def transcribe(
+        self, pcm: bytes, sample_rate: int = 16000, context: str | None = None
+    ) -> ASRResult:
         return ASRResult(self._text, "zh", 0.0)
 
     async def warmup(self) -> None:
@@ -94,13 +111,18 @@ class Qwen3ASRClient:
         )
         self._context = context.strip()
 
-    async def transcribe(self, pcm: bytes, sample_rate: int = 16000) -> ASRResult:
+    async def transcribe(
+        self, pcm: bytes, sample_rate: int = 16000, context: str | None = None
+    ) -> ASRResult:
+        # None keeps the gateway-wide ECHOBRIDGE_ASR_HOTWORDS default; an
+        # explicit "" disables it for a session that cleared its hotword list.
+        effective_context = self._context if context is None else context.strip()
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Sample-Rate": str(sample_rate),
         }
-        if self._context:
-            headers["X-ASR-Context"] = encode_asr_context(self._context)
+        if effective_context:
+            headers["X-ASR-Context"] = encode_asr_context(effective_context)
         response = await self._client.post(
             "/v1/transcribe",
             content=pcm,
@@ -116,7 +138,7 @@ class Qwen3ASRClient:
             len(text),
             language or "-",
             latency,
-            "1" if self._context else "0",
+            "1" if effective_context else "0",
         )
         return ASRResult(text, language, latency)
 

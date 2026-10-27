@@ -35,6 +35,14 @@ def _env_phrases(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return phrases or default
 
 
+def build_asr_context(hotwords: tuple[str, ...] | list[str]) -> str:
+    """Build the free-form Qwen3-ASR context string from hotword terms."""
+    terms = tuple(str(term).strip() for term in hotwords if str(term).strip())
+    if not terms:
+        return ""
+    return "Technical terms: " + ", ".join(terms)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     bind: str = "127.0.0.1"
@@ -108,10 +116,7 @@ class Settings:
         ``context`` is a free-form prompt.  A short "Technical terms:" prefix
         works better than a bare list in practice.
         """
-        terms = tuple(term.strip() for term in self.asr_hotwords if term.strip())
-        if not terms:
-            return ""
-        return "Technical terms: " + ", ".join(terms)
+        return build_asr_context(self.asr_hotwords)
 
     @classmethod
     def from_env(cls) -> "Settings":
