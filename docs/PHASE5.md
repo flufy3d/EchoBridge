@@ -130,7 +130,7 @@ APK：`app/build/outputs/apk/debug/app-debug.apk`。
 
 ### 5.3 真机验收（2026-10-27，X10A / Android 9 / Phh-Treble）
 
-设备日常验收通过 `adb reverse tcp:18787 tcp:18787` 访问主机网关（`ws://127.0.0.1:18787/echobridge/ws`），避免把网关暴露到 LAN/公网；debug APK 允许 cleartext，release 仍只允许 WSS。2026-10-27 另外用 `wss://work-pc.tailea818a.ts.net:8443/echobridge/ws` 在 X10A 上完成了一次真实 WSS 握手与 `session.created` 验证（X10A 的 MagicDNS 不解析，测试时临时加了 hosts 映射；详见 5.6）。
+设备日常验收通过 `adb reverse tcp:18787 tcp:18787` 访问主机网关（`ws://127.0.0.1:18787/echobridge/ws`），避免把网关暴露到 LAN/公网；debug APK 允许 cleartext，release 仍只允许 WSS。2026-10-27 另外用 `wss://work-pc.tailea818a.ts.net:8443/echobridge/ws` 在 X10A 上完成了一次真实 WSS 握手与 `session.created` 验证（X10A 的 MagicDNS 由 `x10a-tailscale` Magisk 模块的 dnsmasq + netd 方案提供，系统 DNS 已能解析 `work-pc.tailea818a.ts.net`；详见 5.6）。
 
 - [x] 默认 doubao：连接、greeting、真实 ASR、get_time 工具、TTS 正常。
 - [x] EchoBridge：连接、greeting、真实一轮对话、get_time、set_emotion + play_animation 多工具、look_and_ask 视觉（识别正确）。
@@ -168,8 +168,8 @@ reply_first_audio_ms 工具轮: 2.2–6.7 s（含 get_time / look_and_ask / 工�
 
 ### 5.5 仍未完成/注意
 
-- **WSS 经 Windows Tailscale Serve 已验证**（见 5.6）；X10A 的 MagicDNS 当前不解析，设备日常测试仍走 `adb reverse` + `ws://127.0.0.1:18787`，或在设备上修好 DNS 后使用 WSS。
-- 默认保存模式最终恢复为 `doubao`；auto 回退只在本次连接生效，未改保存值。
+- **WSS 经 Windows Tailscale Serve 已验证**（见 5.6）；X10A 的系统级 MagicDNS 已由 `x10a-tailscale` Magisk 模块的 dnsmasq + netd 方案提供，WSS 日常可用；`adb reverse` + `ws://127.0.0.1:18787` 仍保留为备用。
+- 默认值仍为 `doubao`；X10A 当前保存为 `echobridge` 用于 WSS 验收；auto 回退只在本次连接生效，未改保存值。
 - 17.8 s 长尾是 provider 侧偶发，不是链路固定延迟；Phase 6 30+ 条 A/B 再统计。
 
 ### 5.6 WSS 403 的复现、根因与修复（2026-10-27）
@@ -241,7 +241,7 @@ rejecting unauthorized websocket from ... auth=bearer auth_len=12 ... tailscale_
 - 设备端：
   - HTTP 401/403 → 明确提示“EchoBridge 拒绝连接/鉴权失败（HTTP 403）...”，不再只显示 `Expected HTTP 101...`。
   - 豆包后端 + EchoBridge URL → 本地 fail-fast，提示切换 `echobridge`/`auto`，不发送 `X-Api-Key`。
-  - 可选 DNS 覆盖：EchoBridge 设置页新增“服务器 IP（可选）”，只替换 OkHttp 的地址解析；URL host、TLS SNI/Host 和证书校验保持不变。用于 MagicDNS 不解析的 tailnet 设备。
+  - App 不再内置 DNS 覆盖；X10A 的系统级 MagicDNS 由 `x10a-tailscale` Magisk 模块的 dnsmasq + netd 方案提供（模块外改动）。
   - `app/build.gradle`：URL 含 `token=` 直接构建失败；URL 已设置但 token 为空时构建警告。
 - 没有修改 Tailscale Serve 配置；继续使用 Bearer；token 不进 URL query；没有 Funnel/公网端口转发；没有关闭鉴权。
 
@@ -257,7 +257,7 @@ rejecting unauthorized websocket from ... auth=bearer auth_len=12 ... tailscale_
 | X10A | Serve WSS 8443 | Bearer 错误 | 403；设备显示明确鉴权错误 |
 | X10A | doubao 后端 + EchoBridge URL | 未发送 X-Api-Key | 本地“配置冲突”，网关无请求 |
 
-X10A 的 MagicDNS 当前不解析 `work-pc.tailea818a.ts.net`（`CorpDNS=false`）；WSS 真机验证时临时给 `/system/etc/hosts` 加了 `100.83.182.104 work-pc.tailea818a.ts.net` 的 bind mount，验证后已卸载。设备端随后增加可选的“服务器 IP”DNS 覆盖：设置 `100.83.182.104` 后仍使用 `wss://work-pc.tailea818a.ts.net:8443/echobridge/ws`，TLS 继续校验原主机名，X10A 实测 `session.created` 成功，设备保持 `echobridge` 模式。没有该设置时仍可走 `adb reverse`。
+X10A 的 MagicDNS 原先不解析（`CorpDNS=false`；Android 应用走 netd，不读 `/etc/resolv.conf`）。WSS 真机验证时曾临时给 `/system/etc/hosts` 加 `100.83.182.104 work-pc.tailea818a.ts.net` 的 bind mount，验证后已卸载。随后在 `x10a-tailscale` Magisk 模块中加入 dnsmasq + netd 方案：dnsmasq 监听 `127.0.0.1:53`，`*.ts.net` 转发到 `100.100.100.100`，其余转发到当前 Wi-Fi DNS，并把 netid 100 的 resolver 指向 `127.0.0.1`。X10A 的系统 `getaddrinfo` 已能解析 `work-pc.tailea818a.ts.net`，无需 App 覆盖即可用 `wss://work-pc.tailea818a.ts.net:8443/echobridge/ws` 完成 `session.created`；普通公网 DNS 仍正常。模块不可用时仍可走 `adb reverse`。
 
 #### 回滚
 
@@ -268,7 +268,7 @@ X10A 的 MagicDNS 当前不解析 `work-pc.tailea818a.ts.net`（`CorpDNS=false`�
 ## 6. 已知限制
 
 - Backchannel 只使用 warmup 时 `ECHOBRIDGE_TTS_VOICE_ID` 的缓存；设备改 localVoiceId 后若未重新 warmup，短音自动跳过（不现场合成，避免增加延迟）。
-- 默认仍保存为 `doubao`；是否把默认改为 auto 由产品验收后决定。
+- 默认值仍为 `doubao`；X10A 当前保存为 `echobridge`；是否把默认改为 auto 由产品验收后决定。
 - 低音量下语音打断需要稍微提高音量（实测 900–1500 RMS）；点击屏幕停止始终可用。
-- WSS 经 Windows Tailscale Serve 已验证；X10A 的 MagicDNS 当前不解析，可在 EchoBridge 设置页填写“服务器 IP（可选）”使用 WSS（只覆盖 DNS，TLS 主机名校验不变），或继续走 `adb reverse` / Tailscale 加密的 `ws://100.x`（debug）。不要用公网端口/Funnel 绕过。
+- WSS 经 Windows Tailscale Serve 已验证；X10A 的系统级 MagicDNS 由 `x10a-tailscale` Magisk 模块的 dnsmasq + netd 方案提供，WSS 可直接使用；`adb reverse` / Tailscale 加密的 `ws://100.x`（debug）仍作为后备。不要用公网端口/Funnel 绕过。
 - 17.8 s 工具 hop 长尾属 provider 偶发；Phase 6 用 30+ 条 A/B 统计。
