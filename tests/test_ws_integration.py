@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -65,18 +66,119 @@ async def test_health_and_probe():
         await stop_server(server, task)
 
 
-async def test_websocket_auth_rejects_bad_token():
+@pytest.mark.parametrize(
+    ("headers", "subprotocols", "expected"),
+    [
+        ({}, None, 403),
+        ({"Authorization": "Bearer wrong"}, None, 403),
+        ({"Authorization": "Bearer test-token"}, None, 101),
+        ({}, ["echobridge", "token.test-token"], 101),
+        (
+            {"Authorization": "Bearer test-token"},
+            ["echobridge", "token.test-token"],
+            101,
+        ),
+    ],
+)
+async def test_websocket_auth_matrix(headers, subprotocols, expected):
     settings = make_settings()
     server, task, port = await start_server(settings)
     try:
-        with pytest.raises(InvalidStatus) as exc:
+        if expected == 403:
+            with pytest.raises(InvalidStatus) as exc:
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/echobridge/ws",
+                    additional_headers=headers,
+                    subprotocols=subprotocols,
+                    open_timeout=3,
+                ):
+                    pass
+            assert exc.value.response.status_code == 403
+            return
+
+        async with websockets.connect(
+            f"ws://127.0.0.1:{port}/echobridge/ws",
+            additional_headers=headers,
+            subprotocols=subprotocols,
+            open_timeout=3,
+        ) as ws:
+            await ws.send(json.dumps(session_create(), ensure_ascii=False))
+            created = await recv_until(ws, "session.created")
+            assert created["session"]["id"]
+            await ws.send(json.dumps({"type": "session.close"}))
+            closed = await recv_until(ws, "session.closed")
+            assert closed["reason"] == "client"
+    finally:
+        await stop_server(server, task)
+
+
+async def test_websocket_auth_log_is_redacted(caplog):
+    settings = make_settings(token="super-secret-token-value")
+    wrong = "wrong-secret"
+    server, task, port = await start_server(settings)
+    try:
+        with caplog.at_level(logging.WARNING, logger="echobridge.app"):
+            with pytest.raises(InvalidStatus):
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/echobridge/ws",
+                    additional_headers={"Authorization": f"Bearer {wrong}"},
+                    open_timeout=3,
+                ):
+                    pass
+
+        text = caplog.text
+        assert "auth=bearer" in text
+        assert f"auth_len={len('Bearer ' + wrong)}" in text
+        assert "subprotocol_len=0" in text
+        assert "tailscale_user=no" in text
+        assert settings.token not in text
+        assert wrong not in text
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="echobridge.app"):
+            with pytest.raises(InvalidStatus):
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{port}/echobridge/ws",
+                    open_timeout=3,
+                ):
+                    pass
+
+        text = caplog.text
+        assert "auth=none" in text
+        assert "auth_len=0" in text
+        assert "subprotocol_len=0" in text
+    finally:
+        await stop_server(server, task)
+
+
+async def test_websocket_accept_log_is_redacted(caplog):
+    settings = make_settings(token="super-secret-token-value")
+    server, task, port = await start_server(settings)
+    try:
+        with caplog.at_level(logging.INFO, logger="echobridge.app"):
             async with websockets.connect(
                 f"ws://127.0.0.1:{port}/echobridge/ws",
-                additional_headers={"Authorization": "Bearer wrong"},
+                additional_headers={
+                    "Authorization": f"Bearer {settings.token}",
+                    "Origin": "https://example.invalid",
+                    "Tailscale-User-Login": "user@example.invalid",
+                    "X-Forwarded-For": "100.64.0.1",
+                },
                 open_timeout=3,
-            ):
-                pass
-        assert exc.value.response.status_code == 403
+            ) as ws:
+                await ws.send(json.dumps(session_create(), ensure_ascii=False))
+                await recv_until(ws, "session.created")
+                await ws.send(json.dumps({"type": "session.close"}))
+                await recv_until(ws, "session.closed")
+
+        text = caplog.text
+        assert "accepted websocket" in text
+        assert "auth=bearer" in text
+        assert "origin=yes" in text
+        assert "tailscale_user=yes" in text
+        assert "xff=yes" in text
+        assert settings.token not in text
+        assert "user@example.invalid" not in text
     finally:
         await stop_server(server, task)
 

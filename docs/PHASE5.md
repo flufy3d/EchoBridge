@@ -1,6 +1,6 @@
 # Phase 5：设备端双后端 + 回退 + 自然 backchannel
 
-状态：**主机 + 真机验收完成（除 Phase 6 的 1h/24h 与生产 WSS 部署）**
+状态：**主机 + 真机验收完成；WSS 经 Windows Tailscale Serve 已验证（2026-10-27）；除 Phase 6 的 1h/24h 与生产部署**
 日期：2026-10-27
 范围：VoiceClient 接口、Doubao/EchoBridge 双后端、独立配置、自动回退、设置页、试听、10 次切换验收、智能 backchannel。
 
@@ -130,7 +130,7 @@ APK：`app/build/outputs/apk/debug/app-debug.apk`。
 
 ### 5.3 真机验收（2026-10-27，X10A / Android 9 / Phh-Treble）
 
-设备通过 `adb reverse tcp:18787 tcp:18787` 访问主机网关（`ws://127.0.0.1:18787/echobridge/ws`），避免把网关暴露到 LAN/公网；debug APK 允许 cleartext，release 仍只允许 WSS。
+设备日常验收通过 `adb reverse tcp:18787 tcp:18787` 访问主机网关（`ws://127.0.0.1:18787/echobridge/ws`），避免把网关暴露到 LAN/公网；debug APK 允许 cleartext，release 仍只允许 WSS。2026-10-27 另外用 `wss://work-pc.tailea818a.ts.net:8443/echobridge/ws` 在 X10A 上完成了一次真实 WSS 握手与 `session.created` 验证（X10A 的 MagicDNS 不解析，测试时临时加了 hosts 映射；详见 5.6）。
 
 - [x] 默认 doubao：连接、greeting、真实 ASR、get_time 工具、TTS 正常。
 - [x] EchoBridge：连接、greeting、真实一轮对话、get_time、set_emotion + play_animation 多工具、look_and_ask 视觉（识别正确）。
@@ -168,14 +168,106 @@ reply_first_audio_ms 工具轮: 2.2–6.7 s（含 get_time / look_and_ask / 工�
 
 ### 5.5 仍未完成/注意
 
-- **Windows Tailscale Serve 的 WSS 认证**：`https://work-pc.tailea818a.ts.net:8443/healthz` 正常，但 WebSocket 升级到达网关后 `_extract_token` 拿不到 Bearer/subprotocol token，返回 403。真机验收因此使用 `adb reverse` + `ws://127.0.0.1:18787`。Phase 6 在原生 Ubuntu 上重建 Serve 后复测；不要用公网端口绕过。
+- **WSS 经 Windows Tailscale Serve 已验证**（见 5.6）；X10A 的 MagicDNS 当前不解析，设备日常测试仍走 `adb reverse` + `ws://127.0.0.1:18787`，或在设备上修好 DNS 后使用 WSS。
 - 默认保存模式最终恢复为 `doubao`；auto 回退只在本次连接生效，未改保存值。
 - 17.8 s 长尾是 provider 侧偶发，不是链路固定延迟；Phase 6 30+ 条 A/B 再统计。
+
+### 5.6 WSS 403 的复现、根因与修复（2026-10-27）
+
+**结论：Tailscale Serve 没有剥离 `Authorization` / `Sec-WebSocket-Protocol`；403 是 EchoBridge 自己的鉴权拒绝。** 修复前的手工探测使用了与运行中网关不一致的 token；设备当时保存 `voice_backend_mode=doubao`，并没有发起 EchoBridge 握手。网关日志里的 `Address(host='100.83.182.104', port=0)` 是 work-pc 本机（Serve 代理源），X10A 的源地址是 `100.83.39.115`。
+
+#### 复现
+
+1. 最小 WebSocket 回显服务器，只记录 header 名称/存在/长度；`token.<...>` 子协议替换为 `token.<redacted>`：
+
+```bash
+# WSL2
+python scripts/ws_header_echo.py --host 0.0.0.0 --port 19443 --once
+# Windows：WSL2 端口桥（TARGET 用 wsl hostname -I）
+python scripts/windows_tcp_proxy.py --port 19443 --target <WSL2-IP> --target-port 19443
+# Windows Tailscale Serve（仅 tailnet；验证完删除）
+tailscale serve --bg --https=9443 http://127.0.0.1:19443
+```
+
+```bash
+python scripts/ws_handshake_probe.py \
+  --url wss://work-pc.tailea818a.ts.net:9443/ \
+  --auth both --no-session-create --expect 101
+```
+
+回显结果：
+
+```text
+authorization_present=true authorization_len=39
+subprotocol_len=50 subprotocol_items=["echobridge","token.<redacted>"]
+tailscale_user_present=true x_forwarded_for_present=true
+```
+
+2. 用运行中网关的 token 经 8443 握手：
+
+```bash
+python scripts/ws_handshake_probe.py --auth bearer --expect 101
+# result=101
+# session.created id=sess_...
+
+python scripts/ws_handshake_probe.py --auth subprotocol --expect 101
+# result=101 subprotocol='echobridge'
+
+python scripts/ws_handshake_probe.py --auth bearer --token wrong --expect 403
+# result=403 Forbidden
+```
+
+网关新诊断（示例，token 值不会出现）：
+
+```text
+accepted websocket from Address(host='100.83.182.104', port=0) path=/echobridge/ws auth=bearer auth_len=39 subprotocol_len=0 ... tailscale_user=yes xff=yes
+rejecting unauthorized websocket from ... auth=none auth_len=0 ... tailscale_user=yes xff=yes
+rejecting unauthorized websocket from ... auth=bearer auth_len=12 ... tailscale_user=yes xff=yes
+```
+
+#### 根因
+
+- `_extract_token` 只接受 `Authorization: Bearer` 或 `Sec-WebSocket-Protocol: ..., token.<token>`；没有或不匹配就 `ws.close(4401)`。Starlette 在 `accept()` 前关闭会表现为 HTTP 403，这是预期行为。
+- 修复前的手工客户端没有携带运行中网关的 32 字符 `var/dev-token`（例如使用了占位值或旧 token），所以 403；同一 token 经 Serve 的 `Authorization` 和子协议两种方式均可 101。
+- X10A 当时 `voice_backend_mode=doubao`、`active_voice_backend=doubao`，`echobridge_ws_url=ws://127.0.0.1:18787/...`，且没有 `adb reverse`；它没有发起 EchoBridge 握手。设备保存的 EchoBridge token 与 `var/dev-token` 一致（32 字符），不是 token 文件不一致。
+- 若把豆包后端的 `doubao_ws_url` 指到 `/echobridge/ws`，设备会发 `X-Api-Key`；EchoBridge 按设计只认 Bearer/子协议，因此必然 403。设备端已加 fail-fast，不再把豆包 key 发给 EchoBridge。
+
+#### 修复
+
+- 服务端 `_auth_diagnostics`：接受/拒绝日志记录 `auth` 来源、`auth_len`、`subprotocol_len`、`origin/ua/device/tailscale_user/xff` 是否存在；不记录 header 值、token、Origin 值或 Tailscale 身份值。
+- `scripts/ws_handshake_probe.py`：Bearer/子协议/两者/无凭据四种方式，支持 `--expect 101|403`，只打印 token 来源和长度。
+- `scripts/ws_header_echo.py`：Serve 回显测试工具。
+- 测试：`tests/test_ws_integration.py` 增加 bearer/子协议/两者/缺失/错误 token 矩阵，以及“日志不含 token/身份值”的断言；`37 passed`。
+- 设备端：
+  - HTTP 401/403 → 明确提示“EchoBridge 拒绝连接/鉴权失败（HTTP 403）...”，不再只显示 `Expected HTTP 101...`。
+  - 豆包后端 + EchoBridge URL → 本地 fail-fast，提示切换 `echobridge`/`auto`，不发送 `X-Api-Key`。
+  - `app/build.gradle`：URL 含 `token=` 直接构建失败；URL 已设置但 token 为空时构建警告。
+- 没有修改 Tailscale Serve 配置；继续使用 Bearer；token 不进 URL query；没有 Funnel/公网端口转发；没有关闭鉴权。
+
+#### 验证
+
+| 客户端 | 路径 | 凭据 | 结果 |
+|---|---|---|---|
+| work-pc `100.83.182.104` | Serve WSS 8443 | Bearer 正确 | 101 + `session.created` |
+| work-pc | Serve WSS 8443 | 子协议正确 | 101 + `session.created` |
+| work-pc | Serve WSS 8443 | 两者 | 101 + `session.created` |
+| work-pc | Serve WSS 8443 | 无/错误 | 403 |
+| X10A `100.83.39.115` | Serve WSS 8443 | Bearer 正确 | 101 + `session.created` `sess_ff0c1190b8a0`，greeting 正常 |
+| X10A | Serve WSS 8443 | Bearer 错误 | 403；设备显示明确鉴权错误 |
+| X10A | doubao 后端 + EchoBridge URL | 未发送 X-Api-Key | 本地“配置冲突”，网关无请求 |
+
+X10A 的 MagicDNS 当前不解析 `work-pc.tailea818a.ts.net`（`CorpDNS=false`）；WSS 真机验证时临时给 `/system/etc/hosts` 加了 `100.83.182.104 work-pc.tailea818a.ts.net` 的 bind mount，验证后已卸载。设备随后恢复原保存状态：`voice_backend_mode=doubao`、`echobridge_ws_url=ws://127.0.0.1:18787/echobridge/ws`。WSS 日常使用需要设备 DNS/MagicDNS，或继续用 `adb reverse`。
+
+#### 回滚
+
+- EchoBridge：`git revert <commit>`；无数据库/配置迁移，回滚后只是少掉诊断日志和探针脚本。
+- 设备：`git revert <commit>` 并重新构建安装；或安装上一版 APK。若只想回滚设备配置，把 `voice_backend_mode` 改回 `doubao`、`echobridge_ws_url` 改回 `ws://127.0.0.1:18787/echobridge/ws`。
+- Serve 未改动，无需回滚。
 
 ## 6. 已知限制
 
 - Backchannel 只使用 warmup 时 `ECHOBRIDGE_TTS_VOICE_ID` 的缓存；设备改 localVoiceId 后若未重新 warmup，短音自动跳过（不现场合成，避免增加延迟）。
 - 默认仍保存为 `doubao`；是否把默认改为 auto 由产品验收后决定。
 - 低音量下语音打断需要稍微提高音量（实测 900–1500 RMS）；点击屏幕停止始终可用。
-- Windows Tailscale Serve 的 WSS 鉴权未通，Phase 6 在原生 Ubuntu 上复测；在此之前设备测试走 `adb reverse` 或 Tailscale 加密的 `ws://100.x`（debug）。
+- WSS 经 Windows Tailscale Serve 已验证；X10A 的 MagicDNS 当前不解析，设备 WSS 需要先修设备 DNS/hosts，或继续走 `adb reverse` / Tailscale 加密的 `ws://100.x`（debug）。不要用公网端口/Funnel 绕过。
 - 17.8 s 工具 hop 长尾属 provider 偶发；Phase 6 用 30+ 条 A/B 统计。

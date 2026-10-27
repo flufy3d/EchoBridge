@@ -4,7 +4,7 @@
 
 A lightweight, model-agnostic voice gateway that connects streaming ASR, LLM, and TTS services through a unified Realtime API.
 
-> 🚧 **Status: Phase 5.** The gateway has Silero VAD, Qwen3-ASR, Qwen3-TTS via vLLM-Omni, DeepSeek Flash streaming with tools, and cached natural backchannels. Device dual-backend integration, auto fallback, real-device 10-switch, backchannel, interrupt/stop, vision and sleep/wake acceptance passed; production WSS/deployment remains Phase 6. See [`docs/PHASE5.md`](docs/PHASE5.md) and [`docs/PHASE4.md`](docs/PHASE4.md) for latency/tool results and the known first-audio p50 gap.
+> 🚧 **Status: Phase 5.** The gateway has Silero VAD, Qwen3-ASR, Qwen3-TTS via vLLM-Omni, DeepSeek Flash streaming with tools, and cached natural backchannels. Device dual-backend integration, auto fallback, real-device 10-switch, backchannel, interrupt/stop, vision and sleep/wake acceptance passed; WSS via Windows Tailscale Serve is verified (Bearer and subprotocol), production deployment remains Phase 6. See [`docs/PHASE5.md`](docs/PHASE5.md) and [`docs/PHASE4.md`](docs/PHASE4.md) for latency/tool results and the known first-audio p50 gap.
 
 ---
 

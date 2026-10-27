@@ -39,6 +39,40 @@ def _has_probe_protocol(ws: WebSocket) -> bool:
     return any(item.strip() == "echobridge" for item in protocols.split(","))
 
 
+def _auth_diagnostics(ws: WebSocket) -> str:
+    """Describe auth-bearing headers without ever logging their values.
+
+    The gateway sits behind Tailscale Serve in development.  When a 403 is
+    reported, the first question is always "did the proxy drop Authorization?".
+    Header names, presence and lengths answer that question while keeping the
+    token, Origin and Tailscale identity out of the logs.
+    """
+
+    headers = ws.headers
+    auth = headers.get("authorization", "")
+    protocols = headers.get("sec-websocket-protocol", "")
+    if auth.lower().startswith("bearer "):
+        source = "bearer"
+    elif any(
+        item.strip().startswith("token.") for item in protocols.split(",")
+    ):
+        source = "subprotocol"
+    else:
+        source = "none"
+
+    def present(name: str) -> str:
+        return "yes" if headers.get(name) else "no"
+
+    return (
+        f"auth={source} auth_len={len(auth)} "
+        f"subprotocol_len={len(protocols)} "
+        f"origin={present('origin')} ua={present('user-agent')} "
+        f"device={present('x-device-id')} "
+        f"tailscale_user={present('tailscale-user-login')} "
+        f"xff={present('x-forwarded-for')}"
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     manager = SessionManager()
@@ -120,9 +154,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def websocket_endpoint(ws: WebSocket) -> None:
         token = _extract_token(ws)
         if not token or not hmac.compare_digest(token, settings.token):
-            logger.warning("rejecting unauthorized websocket from %s", ws.client)
+            logger.warning(
+                "rejecting unauthorized websocket from %s path=%s %s",
+                ws.client,
+                ws.url.path,
+                _auth_diagnostics(ws),
+            )
             await ws.close(code=4401, reason="unauthorized")
             return
+        logger.info(
+            "accepted websocket from %s path=%s %s",
+            ws.client,
+            ws.url.path,
+            _auth_diagnostics(ws),
+        )
 
         device_id = (
             ws.headers.get("x-device-id")
