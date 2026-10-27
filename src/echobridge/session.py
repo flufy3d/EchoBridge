@@ -22,7 +22,8 @@ from typing import Any, Protocol
 from . import protocol
 from .asr import ASRBackend, MockASR
 from .config import Settings
-from .llm import MockLLM, MockPlan
+from .llm import MockLLM
+from .llm_deepseek import DeepSeekLLM, build_system_prompt
 from .logging import get_logger
 from .pacer import AudioPacer
 from .text import split_for_tts
@@ -79,12 +80,13 @@ class Session:
         self._pacer: AudioPacer | None = None
         self._response_active = False
         self._pending_tools: dict[str, asyncio.Future[str]] = {}
-        self._history: list[dict[str, str]] = []
+        self._history: list[dict[str, Any]] = []
 
         self._speech_buffers: dict[str, str] = {}
         self._spec_task: asyncio.Task | None = None
         self._spec_item = ""
         self._llm = MockLLM(settings.llm_char_delay_ms)
+        self._deepseek = DeepSeekLLM(settings) if settings.llm_backend == "deepseek" else None
         from .tts import make_tts
 
         self._tts = tts or make_tts(settings)
@@ -356,8 +358,9 @@ class Session:
         ctx = self._begin_response()
         self._history.append({"role": "user", "content": transcript})
         self._trim_history()
+        runner = self._run_deepseek_turn if self._deepseek is not None else self._run_turn
         self._response_task = asyncio.create_task(
-            self._run_turn(ctx, transcript), name=f"turn-{ctx.response_id}"
+            runner(ctx, transcript), name=f"turn-{ctx.response_id}"
         )
 
     async def _start_greeting(self, text: str) -> None:
@@ -380,8 +383,7 @@ class Session:
         try:
             plan = self._llm.plan(transcript, self._tool_names)
             if plan.tool_calls:
-                ok = await self._run_tools(ctx, plan.tool_calls)
-                if not ok:
+                if await self._run_tools(ctx, plan.tool_calls) is None:
                     return
             text = (plan.text_before + plan.text_after).strip()
             if text:
@@ -413,19 +415,19 @@ class Session:
 
     async def _run_tools(
         self, ctx: protocol.ResponseContext, calls: list[protocol.ToolCall]
-    ) -> bool:
+    ) -> list[tuple[protocol.ToolCall, str]] | None:
         usable = [call for call in calls if call.name in self._tool_names]
         dropped = [call.name for call in calls if call.name not in self._tool_names]
         if dropped:
             logger.info("dropping unavailable/mock tools: %s", ",".join(sorted(set(dropped))))
         if not usable:
-            return True
+            return []
         self._pending_tools = {
             call.call_id: asyncio.get_running_loop().create_future() for call in usable
         }
         ok = await self._send(protocol.tool_call_done(ctx, usable), ctx=ctx)
         if not ok:
-            return False
+            return None
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*self._pending_tools.values()),
@@ -436,33 +438,54 @@ class Session:
             if ctx.generation == self._generation and not self._closed:
                 self._generation += 1
                 await self._send(protocol.response_canceled(ctx), force=True)
-            return False
+            return None
         finally:
             self._pending_tools.clear()
-        for call, result in zip(usable, results):
+        pairs = list(zip(usable, results))
+        for call, result in pairs:
             logger.info(
                 "tool result call=%s name=%s chars=%d",
                 call.call_id,
                 call.name,
                 len(result or ""),
             )
-            self._history.append({"role": "tool", "name": call.name, "content": result or "ok"})
+            self._history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "name": call.name,
+                    "content": result or "ok",
+                }
+            )
         self._trim_history()
-        return ctx.generation == self._generation
+        return pairs
 
     async def _speak(
         self, ctx: protocol.ResponseContext, text: str, *, emit_text: bool
     ) -> None:
+        source = self._llm.stream_text(text) if emit_text else self._single_text(text)
+        await self._stream_speech(ctx, source, emit_text=emit_text)
+        await self._send(protocol.response_done(ctx, "completed"), ctx=ctx)
+
+    @staticmethod
+    async def _single_text(text: str):
+        yield text
+
+    async def _stream_speech(self, ctx, source, *, emit_text: bool) -> str:
         pacer = AudioPacer(self._send_response_event, ctx)
         self._pacer = pacer
         pacer.start()
-
-        if emit_text:
-            buffer = ""
-            first_chunk = True
-            async for delta in self._llm.stream_text(text):
-                if not await self._send(protocol.text_delta(ctx, delta), ctx=ctx):
-                    return
+        buffer = ""
+        full = ""
+        first_chunk = True
+        try:
+            async for delta in source:
+                if not isinstance(delta, str) or not delta:
+                    continue
+                full += delta
+                if emit_text:
+                    if not await self._send(protocol.text_delta(ctx, delta), ctx=ctx):
+                        return full
                 buffer += delta
                 limit = 15 if first_chunk else 18
                 if self._should_flush(buffer, limit):
@@ -471,14 +494,93 @@ class Session:
                     first_chunk = False
             if buffer.strip():
                 await self._synthesize_into(pacer, buffer, ctx)
-        else:
-            await self._synthesize_into(pacer, text, ctx)
+            await pacer.finish()
+            if emit_text and full:
+                await self._send(protocol.text_done(ctx, full), ctx=ctx)
+            return full
+        finally:
+            pacer.cancel()
 
-        await pacer.finish()
-        if emit_text:
-            if not await self._send(protocol.text_done(ctx, text), ctx=ctx):
+    async def _run_deepseek_turn(
+        self, ctx: protocol.ResponseContext, transcript: str
+    ) -> None:
+        try:
+            if self._deepseek is None:
+                raise RuntimeError("DeepSeek backend not initialized")
+            for _hop in range(3):
+                tool_calls: list[protocol.ToolCall] = []
+                text_parts: list[str] = []
+
+                async def text_source():
+                    async for delta in self._deepseek.stream(
+                        self._build_llm_messages(), self._tools_openai
+                    ):
+                        if delta.text:
+                            text_parts.append(delta.text)
+                            yield delta.text
+                        if delta.tool_calls:
+                            tool_calls.extend(delta.tool_calls)
+
+                text = await self._stream_speech(ctx, text_source(), emit_text=True)
+                if tool_calls:
+                    self._history.append(
+                        {
+                            "role": "assistant",
+                            "content": text or None,
+                            "tool_calls": [
+                                {
+                                    "id": call.call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": call.name,
+                                        "arguments": call.arguments,
+                                    },
+                                }
+                                for call in tool_calls
+                            ],
+                        }
+                    )
+                    results = await self._run_tools(ctx, tool_calls)
+                    if results is None:
+                        return
+                    if not results:
+                        # All calls were filtered (e.g. a hallucinated
+                        # ask_expert).  Keep the OpenAI tool-call chain valid.
+                        for call in tool_calls:
+                            self._history.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call.call_id,
+                                    "name": call.name,
+                                    "content": "该工具不可用，请直接回答。",
+                                }
+                            )
+                    self._trim_history()
+                    await self._send(protocol.response_done(ctx, "tool_calls"), ctx=ctx)
+                    ctx = self._begin_response()
+                    continue
+                if text:
+                    self._history.append({"role": "assistant", "content": text})
+                    self._trim_history()
+                await self._send(
+                    protocol.response_done(ctx, "completed" if text else "empty"), ctx=ctx
+                )
                 return
-        await self._send(protocol.response_done(ctx, "completed"), ctx=ctx)
+            await self._send(protocol.response_canceled(ctx), force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("deepseek turn failed response=%s", ctx.response_id)
+            if not self._closed and ctx.generation == self._generation:
+                await self._send(protocol.response_done(ctx, "failed"), ctx=ctx)
+        finally:
+            self._finish_response(ctx)
+
+    def _build_llm_messages(self) -> list[dict[str, Any]]:
+        return [
+            {"role": "system", "content": build_system_prompt(self._instructions)},
+            *self._history,
+        ]
 
     async def _synthesize_into(
         self, pacer: AudioPacer, text: str, ctx: protocol.ResponseContext
@@ -584,9 +686,13 @@ class Session:
         if not self._closed:
             await self._cancel_active(send_canceled=False, reason="shutdown")
             self._closed = True
+        if self._deepseek is not None:
+            await self._deepseek.close()
 
     def _trim_history(self) -> None:
-        # Phase 1 mock does not use history, but keep the shape bounded for the
-        # DeepSeek adapter.
-        if len(self._history) > 40:
-            self._history = self._history[-40:]
+        if len(self._history) <= 60:
+            return
+        trimmed = self._history[-60:]
+        while trimmed and trimmed[0].get("role") == "tool":
+            trimmed.pop(0)
+        self._history = trimmed

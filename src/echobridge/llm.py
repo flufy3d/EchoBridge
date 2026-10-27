@@ -23,6 +23,13 @@ class MockPlan:
     text_after: str = ""
 
 
+@dataclass(slots=True)
+class LLMDelta:
+    text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    done: bool = False
+
+
 class MockLLM:
     def __init__(self, char_delay_ms: int = 12) -> None:
         self._char_delay = max(0, char_delay_ms) / 1000.0

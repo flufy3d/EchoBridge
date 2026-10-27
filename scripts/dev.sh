@@ -29,6 +29,13 @@ export ECHOBRIDGE_TTS_URL="${ECHOBRIDGE_TTS_URL:-http://127.0.0.1:18802}"
 export ECHOBRIDGE_TTS_VOICE_ID="${ECHOBRIDGE_TTS_VOICE_ID:-mingyue_v1}"
 export ECHOBRIDGE_TTS_REF_AUDIO="${ECHOBRIDGE_TTS_REF_AUDIO:-$HOME/.cache/echobridge/voices/mingyue/reference.wav}"
 export ECHOBRIDGE_TTS_REF_TEXT="${ECHOBRIDGE_TTS_REF_TEXT:-$HOME/.cache/echobridge/voices/mingyue/reference.txt}"
+if [[ -f "$ROOT/var/llm.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ROOT/var/llm.env"
+  set +a
+fi
+export ECHOBRIDGE_LLM_BACKEND="${ECHOBRIDGE_LLM_BACKEND:-deepseek}"
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "EchoBridge dev server"

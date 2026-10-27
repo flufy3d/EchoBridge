@@ -61,6 +61,15 @@ class Settings:
     tts_ref_text: str = "~/.cache/echobridge/voices/mingyue/reference.txt"
     tts_api_key: str = "EMPTY"
 
+    llm_backend: str = "mock"
+    llm_url: str = "https://opencode.ai/inference/openai/v1/chat/completions"
+    llm_model: str = "deepseek-v4.1-flash"
+    llm_api_key: str = ""
+    llm_max_tokens: int = 400
+    llm_temperature: float = 0.6
+    llm_first_token_timeout_s: float = 8.0
+    llm_total_timeout_s: float = 30.0
+
     # Mock LLM/TTS pacing.
     llm_char_delay_ms: int = 12
     tts_first_chunk_ms: int = 60
@@ -117,6 +126,19 @@ class Settings:
                 "~/.cache/echobridge/voices/mingyue/reference.txt",
             ),
             tts_api_key=os.environ.get("ECHOBRIDGE_TTS_API_KEY", "EMPTY"),
+            llm_backend=os.environ.get("ECHOBRIDGE_LLM_BACKEND", "mock").strip().lower(),
+            llm_url=os.environ.get(
+                "ECHOBRIDGE_LLM_URL",
+                "https://opencode.ai/inference/openai/v1/chat/completions",
+            ),
+            llm_model=os.environ.get("ECHOBRIDGE_LLM_MODEL", "deepseek-v4.1-flash").strip(),
+            llm_api_key=os.environ.get("ECHOBRIDGE_LLM_API_KEY", "").strip(),
+            llm_max_tokens=_env_int("ECHOBRIDGE_LLM_MAX_TOKENS", 400),
+            llm_temperature=float(os.environ.get("ECHOBRIDGE_LLM_TEMPERATURE", "0.6")),
+            llm_first_token_timeout_s=float(
+                os.environ.get("ECHOBRIDGE_LLM_FIRST_TOKEN_TIMEOUT_S", "8")
+            ),
+            llm_total_timeout_s=float(os.environ.get("ECHOBRIDGE_LLM_TOTAL_TIMEOUT_S", "30")),
             llm_char_delay_ms=_env_int("ECHOBRIDGE_LLM_CHAR_DELAY_MS", 12),
             tts_first_chunk_ms=_env_int("ECHOBRIDGE_TTS_FIRST_CHUNK_MS", 60),
             tts_tone_char_ms=_env_int("ECHOBRIDGE_TTS_TONE_CHAR_MS", 55),

@@ -56,6 +56,19 @@ def make_tools() -> list[dict[str, Any]]:
             "description": "获取当前时间",
             "parameters": {"type": "object", "properties": {}},
         },
+        {
+            "type": "function",
+            "name": "look_and_ask",
+            "description": "查看摄像头当前画面，回答用户关于眼前事物的问题",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "关于画面的问题"},
+                    "context": {"type": "string", "description": "可选上下文"},
+                },
+                "required": ["question"],
+            },
+        },
     ]
 
 
@@ -242,6 +255,10 @@ class Client:
                         )
                         print(f"  -> tool result x{len(fresh)}")
                 if event.get("type") == "response.done":
+                    # A tool-call response is followed by a continuation
+                    # response after conversation.item.create; keep waiting.
+                    if event.get("status") == "tool_calls":
+                        continue
                     return event
             await asyncio.sleep(0.01)
 

@@ -80,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "vad": settings.vad_backend,
                 "asr": settings.asr_backend,
                 "tts": settings.tts_backend,
+                "llm": settings.llm_backend,
                 "active": None
                 if active is None
                 else {
