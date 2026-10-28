@@ -20,8 +20,8 @@ from .logging import get_logger
 logger = get_logger("echobridge.asr")
 
 # Qwen3-ASR's context is a prompt, not a constrained decoder.  On noise or
-# very short audio it can echo the whole prompt.  Only suppress the obvious
-# failure mode: every configured hotword appears and almost nothing else.
+# very short audio it can echo the prompt, often only part of it.  Suppress
+# results that are just 3+ configured hotwords (plus a little punctuation).
 _ECHO_PREFIXES = ("technicalterms", "hotwords", "terms", "专有名词", "热词")
 
 
@@ -48,7 +48,15 @@ def _normalize_echo(text: str) -> str:
 
 
 def is_hotword_echo(text: str, hotwords: tuple[str, ...]) -> bool:
-    """Return True when ASR returned the hotword prompt instead of speech."""
+    """Return True when ASR returned the hotword prompt instead of speech.
+
+    Qwen3-ASR's ``context`` is a free-form prompt, not a constrained decoder.
+    On noise or very short audio it often answers with *part* of the configured
+    term list (typically the Chinese terms, in prompt order) rather than a
+    transcript.  Requiring the whole list -- or an exact match for every term,
+    since ASR can mangle one (溟月 -> 淏月) -- misses that case, so treat a
+    result that is 3+ hotwords and almost nothing else as an echo.
+    """
     terms = tuple(term.strip() for term in hotwords if term.strip())
     if len(terms) < 3:
         return False
@@ -61,10 +69,12 @@ def is_hotword_echo(text: str, hotwords: tuple[str, ...]) -> bool:
         if token and token in remainder:
             hits += 1
             remainder = remainder.replace(token, "", 1)
-    if hits != len(terms):
+    if hits < 3:
         return False
     for prefix in _ECHO_PREFIXES:
         remainder = remainder.replace(prefix, "")
+    # Leftover budget covers punctuation plus one short misrecognized term;
+    # "豆包，小鲸鱼，大肥鱼，你们好" keeps three characters and is real speech.
     return len(remainder) <= 2
 
 

@@ -23,7 +23,7 @@ def test_hotwords_build_context(monkeypatch):
     settings = Settings.from_env()
     assert settings.asr_hotwords == HOTWORDS
     assert settings.asr_context == (
-        "Technical terms: ChatGPT, Claude, DeepSeek, 豆包, 溟月, 小鲸鱼, 大肥鱼"
+        "专有名词：ChatGPT、Claude、DeepSeek、豆包、溟月、小鲸鱼、大肥鱼"
     )
 
 
@@ -50,13 +50,27 @@ def test_context_header_is_utf8_base64():
 
 def test_full_hotword_list_echo_is_detected():
     assert is_hotword_echo(
-        "Technical terms: ChatGPT, Claude, DeepSeek, 豆包, 溟月, 小鲸鱼, 大肥鱼",
+        "专有名词：ChatGPT、Claude、DeepSeek、豆包、溟月、小鲸鱼、大肥鱼",
         HOTWORDS,
     )
     assert is_hotword_echo(
         "ChatGPT Claude DeepSeek 豆包 溟月 小鲸鱼 大肥鱼。",
         HOTWORDS,
     )
+    # The old English context format must stay covered too.
+    assert is_hotword_echo(
+        "Technical terms: ChatGPT, Claude, DeepSeek, 豆包, 溟月, 小鲸鱼, 大肥鱼",
+        HOTWORDS,
+    )
+
+
+def test_partial_hotword_list_echo_is_detected():
+    # Observed on 2026-10-28: ambient noise made Qwen3-ASR echo only the
+    # Chinese tail of the context prompt (and mangle one term).  No LLM turn
+    # should be started from this.
+    assert is_hotword_echo("豆包，淏月，小鲸鱼，大肥鱼。", HOTWORDS)
+    assert is_hotword_echo("豆包，小鲸鱼，大肥鱼。", HOTWORDS)
+    assert is_hotword_echo("溟月、豆包、小鲸鱼", HOTWORDS)
 
 
 def test_normal_speech_is_not_detected_as_echo():
@@ -64,6 +78,8 @@ def test_normal_speech_is_not_detected_as_echo():
     assert not is_hotword_echo("溟月，今天天气怎么样", HOTWORDS)
     assert not is_hotword_echo("帮我比较一下 ChatGPT 和 Claude", HOTWORDS)
     assert not is_hotword_echo("小鲸鱼和大肥鱼都在吗", HOTWORDS)
+    assert not is_hotword_echo("豆包，小鲸鱼，大肥鱼，你们好", HOTWORDS)
+    assert not is_hotword_echo("溟月，豆包，小鲸鱼，你们好", HOTWORDS)
 
 
 class _RecordingASR:
@@ -122,7 +138,7 @@ async def _run_session_context(event: dict) -> str | None:
 async def test_session_create_hotwords_override_gateway_default():
     event = session_create()
     event["extension"]["asr"]["extra"]["hotwords"] = ["ChatGPT", "溟月"]
-    assert await _run_session_context(event) == "Technical terms: ChatGPT, 溟月"
+    assert await _run_session_context(event) == "专有名词：ChatGPT、溟月"
 
 
 async def test_session_create_without_hotwords_uses_gateway_default():

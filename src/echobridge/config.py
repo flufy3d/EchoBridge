@@ -40,7 +40,9 @@ def build_asr_context(hotwords: tuple[str, ...] | list[str]) -> str:
     terms = tuple(str(term).strip() for term in hotwords if str(term).strip())
     if not terms:
         return ""
-    return "Technical terms: " + ", ".join(terms)
+    # A Chinese prefix and separators bias Chinese term spellings far better
+    # than "Technical terms: ..." (verified with 溟月 at 8 dB SNR).
+    return "专有名词：" + "、".join(terms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,8 +120,9 @@ class Settings:
         """Context string sent to Qwen3-ASR for contextual biasing.
 
         The open-source Qwen3-ASR package has no weighted vocabulary table;
-        ``context`` is a free-form prompt.  A short "Technical terms:" prefix
-        works better than a bare list in practice.
+        ``context`` is a free-form prompt.  A short Chinese "专有名词：" prefix
+        biases Chinese term spellings better than the old English prefix;
+        keep the list short.
         """
         return build_asr_context(self.asr_hotwords)
 
