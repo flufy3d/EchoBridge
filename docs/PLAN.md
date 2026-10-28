@@ -458,7 +458,7 @@ TOOL_WAIT
 | 总超时 | 30 s（不含工具执行等待） |
 | 429 | 指数退避 1 s/2 s，最多 2 次；5xx 重试 1 次；4xx 不重试 |
 | 空 content | 不送 TTS；若有 tool_calls 继续工具；否则 response.done |
-| 上下文 | system + 最近 20 条消息/约 6k tokens；保留 system 和未完成的 tool 链 |
+| 上下文 | system + 最近 60 条消息（纯聊天约 30 轮；工具轮更少）；按消息条数截断，保留 system 和完整 tool 链；不做 token 统计/摘要压缩；`_history` 仅内存，重连清空 |
 | 温度 | 0.6–0.7（Phase 4 调） |
 | max_tokens | 300–400（语音短回复） |
 
@@ -506,6 +506,16 @@ TOOL_WAIT
 - 多个调用：同一 `items` 数组；App 并行执行后合并回传；网关按 call_id 匹配，全部到齐再继续。
 - 工具等待 25 s；超时发 `response.canceled`，避免 App 卡 pending。
 - 工具失败是正常结果（App 返回中文兜底），照常回填给 LLM，由 LLM 自然转述。
+
+### 8.4 上下文与记忆（当前实现）
+
+- `Session._history` 只存在于网关进程内存；每次新的 WSS 连接 + `session.create` 创建新 `Session`，历史从空开始。重连、休眠恢复、网关重启都不继承历史。
+- 每轮写入历史的内容：user ASR 文本、assistant 最终文本、assistant `tool_calls`、`role=tool` 工具结果。greeting 和 `reasoning_content` 不写入。
+- 请求消息 = `system`（`session.create.instructions` + 实时语音约束）+ `_history`。
+- `_trim_history()` 在每次写入后执行：最多保留最近 60 条；超出时从头部整条丢弃；若头部是 `role=tool`，继续丢弃，保证 tool 链不从中间开始。
+- 纯聊天约 30 轮后开始遗忘最早内容；带工具调用时每轮约 4 条，约 15 轮开始遗忘。
+- 当前没有 token 计数、摘要压缩、向量检索或落盘；设备端 SQLite 只做记录，不回传网关作为上下文。
+- 记忆与压缩的设计讨论见 `docs/CONTEXT.md`（讨论稿，尚未实施）。
 
 ---
 
