@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import __version__
@@ -19,6 +19,7 @@ from .logging import get_logger
 from .manager import SessionManager
 from .tts import make_tts
 from .vad import make_vad
+from .voices import load_voice_registry
 
 logger = get_logger("echobridge.app")
 
@@ -146,13 +147,14 @@ def _auth_diagnostics(ws: WebSocket) -> str:
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     manager = SessionManager()
+    voice_registry = load_voice_registry(settings)
     shared_vad = make_vad(settings)
     shared_asr = make_asr(settings) if settings.asr_backend == "qwen3" else None
     # Keep one TTS client for the whole gateway: its cache holds the fixed
     # greeting and the backchannel fillers warmed at startup.  Previously only
     # the HF qwen3 backend was shared; vLLM sessions each rebuilt an empty
     # cache, which made "prewarmed" greetings and backchannels ineffective.
-    shared_tts = make_tts(settings)
+    shared_tts = make_tts(settings, voice_registry)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -176,6 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="EchoBridge", version=__version__, lifespan=lifespan)
     app.state.settings = settings
     app.state.manager = manager
+    app.state.voice_registry = voice_registry
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -238,6 +241,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
         return "\n".join(lines) + "\n"
 
+    @app.get("/voices")
+    async def voices(request: Request) -> JSONResponse:
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not token or not hmac.compare_digest(token, settings.token):
+            logger.warning(
+                "rejecting unauthorized voices request from %s", request.client
+            )
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return JSONResponse(voice_registry.public())
+
     @app.get("/")
     async def index() -> JSONResponse:
         return JSONResponse(
@@ -245,6 +263,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "name": "EchoBridge",
                 "version": __version__,
                 "ws": "/echobridge/ws",
+                "voices": "/voices",
                 "health": "/healthz",
                 "ready": "/readyz",
                 "metrics": "/metrics",
@@ -300,6 +319,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             asr=session_asr,
             vad=shared_vad,
             tts=shared_tts,
+            voice_registry=voice_registry,
         )
         if session is None:
             await ws.close(code=1013, reason="busy")

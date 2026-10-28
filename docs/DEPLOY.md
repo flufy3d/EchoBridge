@@ -101,8 +101,13 @@ ECHOBRIDGE_TTS_URL=http://127.0.0.1:18802
 ECHOBRIDGE_LLM_BACKEND=deepseek
 ECHOBRIDGE_LLM_API_KEY=<只放 env>
 ECHOBRIDGE_TTS_GPU_UTIL=0.40
+ECHOBRIDGE_TTS_VOICE_DIR=~/.cache/echobridge/voices/mingyue
+# 可选；留空使用 <voice_dir>/voices.json
+ECHOBRIDGE_TTS_VOICE_REGISTRY=
 ECHOBRIDGE_WATCHDOG_GRACE_S=300
 ```
+
+多音色 registry、默认音色兼容和新增音色步骤见 `docs/VOICES.md`。
 
 - `ECHOBRIDGE_BIND` 必须是 `127.0.0.1`。Tailscale Serve 在 Windows 侧代理 WSL 的 localhost；不要为了“能连上”改成 `0.0.0.0`。
 - 不要在 URL 中放 token；客户端用 `Authorization: Bearer` 或 `Sec-WebSocket-Protocol: token.<token>`。

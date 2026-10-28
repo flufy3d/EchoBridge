@@ -34,6 +34,14 @@ DEFAULT_INSTRUCT = (
     "句尾轻微上扬；自然清晰，不要过度夹子音/萝莉音，不要播音腔。"
 )
 
+# Fixed identities for the three confirmed candidates.  The default voice id
+# stays ``mingyue_v1`` so existing app settings keep working.
+VOICE_IDENTITIES = {
+    1: ("mingyue_xixi_v1", "汐汐", "明亮活泼，音调偏高"),
+    2: ("mingyue_nuonuo_v1", "糯糯", "软糯温柔，音量偏轻"),
+    3: ("mingyue_v1", "月月", "温暖自然，默认声线"),
+}
+
 
 def wav_stats(path: Path) -> dict:
     with wave.open(str(path), "rb") as handle:
@@ -62,8 +70,19 @@ def main() -> None:
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--instruct", default=DEFAULT_INSTRUCT)
     parser.add_argument("--candidates", type=int, default=3)
+    parser.add_argument(
+        "--default-candidate",
+        type=int,
+        default=3,
+        help="candidate_N.wav to expose as the default voice (default: 3)",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+
+    if args.default_candidate not in VOICE_IDENTITIES:
+        raise SystemExit("--default-candidate must be 1, 2, or 3")
+    if args.candidates < args.default_candidate:
+        raise SystemExit("--candidates must be >= --default-candidate")
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -105,26 +124,59 @@ def main() -> None:
         )
 
     best = sorted(rows, key=score)[0]
-    best_path = Path(best["path"])
-    (out / "reference.wav").write_bytes(best_path.read_bytes())
+    chosen = rows[args.default_candidate - 1]
+    chosen_path = Path(chosen["path"])
+    (out / "reference.wav").write_bytes(chosen_path.read_bytes())
     (out / "reference.txt").write_text(args.text, encoding="utf-8")
     meta = {
-        "selected": best["candidate"],
+        "selected": chosen["candidate"],
+        "recommended": best["candidate"],
+        "default_candidate": chosen["candidate"],
         "text": args.text,
         "instruct": args.instruct,
         "model": args.model,
         "candidates": rows,
-        "stats": best,
+        "stats": chosen,
     }
     (out / "voice.meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    # Remove a stale clone prompt if the reference changed.
-    for name in ("prompt.pt", "prompt.meta.json"):
-        p = out / name
-        if p.exists():
-            p.unlink()
-    print(f"selected candidate {best['candidate']} -> {out / 'reference.wav'}")
+
+    default_id = VOICE_IDENTITIES[chosen["candidate"]][0]
+    voices = []
+    ordered_rows = [chosen] + [row for row in rows if row is not chosen]
+    for row in ordered_rows:
+        identity = VOICE_IDENTITIES.get(row["candidate"])
+        if identity is None:
+            continue
+        voice_id, name, description = identity
+        voices.append(
+            {
+                "id": voice_id,
+                "name": name,
+                "description": description,
+                "ref_audio": f"candidate_{row['candidate']}.wav",
+                "ref_text_file": "reference.txt",
+            }
+        )
+    (out / "voices.json").write_text(
+        json.dumps(
+            {"default": default_id, "voices": voices}, ensure_ascii=False, indent=2
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # Remove stale clone prompts; each voice now has its own prompt file.
+    stale = [out / "prompt.pt", out / "prompt.meta.json"]
+    stale.extend(out.glob("prompt.*.pt"))
+    stale.extend(out.glob("prompt.*.meta.json"))
+    for path in {path for path in stale if path.exists()}:
+        path.unlink()
+    print(
+        f"selected candidate {chosen['candidate']} -> {out / 'reference.wav'}; "
+        f"voices.json default={default_id}"
+    )
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ class _RecordingASR:
         return None
 
 
-async def test_session_create_hotwords_override_gateway_default():
+async def _run_session_context(event: dict) -> str | None:
     ws = FakeWebSocket()
     asr = _RecordingASR()
     session = Session(
@@ -92,8 +92,6 @@ async def test_session_create_hotwords_override_gateway_default():
     )
     task = asyncio.create_task(session.run())
     try:
-        event = session_create()
-        event["extension"]["asr"]["extra"]["hotwords"] = ["ChatGPT", "溟月"]
         await ws.push(event)
         await ws.wait_for_type("session.created")
 
@@ -115,7 +113,31 @@ async def test_session_create_hotwords_override_gateway_default():
         await ws.wait_for_type(
             "conversation.item.input_audio_transcription.completed"
         )
-        assert asr.contexts[-1] == "Technical terms: ChatGPT, 溟月"
+        return asr.contexts[-1]
     finally:
         await session.close("test")
         await asyncio.wait_for(task, timeout=2)
+
+
+async def test_session_create_hotwords_override_gateway_default():
+    event = session_create()
+    event["extension"]["asr"]["extra"]["hotwords"] = ["ChatGPT", "溟月"]
+    assert await _run_session_context(event) == "Technical terms: ChatGPT, 溟月"
+
+
+async def test_session_create_without_hotwords_uses_gateway_default():
+    # None tells Qwen3ASRClient to use the gateway-wide ECHOBRIDGE_ASR_HOTWORDS.
+    assert await _run_session_context(session_create()) is None
+
+
+async def test_session_create_empty_hotwords_disables_gateway_default():
+    event = session_create()
+    event["extension"]["asr"]["extra"]["hotwords"] = []
+    assert await _run_session_context(event) == ""
+
+
+async def test_echobridge_ignores_doubao_boosting_table_id():
+    event = session_create()
+    event["extension"]["asr"]["extra"] = {"boosting_table_id": "tbl_123"}
+    # EchoBridge has no weighted table: leave the gateway-wide default intact.
+    assert await _run_session_context(event) is None

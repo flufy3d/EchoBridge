@@ -98,21 +98,57 @@ def parse_event(raw: str | bytes) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def session_created(session_id: str, model: str, backend: str = "echobridge-mock") -> dict[str, Any]:
+def _session_payload(
+    session_id: str,
+    model: str,
+    backend: str,
+    voice: str | None,
+    voice_name: str | None,
+    voice_fallback: bool | None,
+) -> dict[str, Any]:
+    session: dict[str, Any] = {
+        "id": session_id,
+        "model": model,
+        "backend": backend,
+    }
+    if voice is not None:
+        session["voice"] = voice
+    if voice_name is not None:
+        session["voice_name"] = voice_name
+    if voice_fallback is not None:
+        session["voice_fallback"] = bool(voice_fallback)
+    return session
+
+
+def session_created(
+    session_id: str,
+    model: str,
+    backend: str = "echobridge-mock",
+    voice: str | None = None,
+    voice_name: str | None = None,
+    voice_fallback: bool | None = None,
+) -> dict[str, Any]:
     return {
         "type": SESSION_CREATED,
-        "session": {
-            "id": session_id,
-            "model": model,
-            "backend": backend,
-        },
+        "session": _session_payload(
+            session_id, model, backend, voice, voice_name, voice_fallback
+        ),
     }
 
 
-def session_updated(session_id: str, model: str, backend: str = "echobridge-mock") -> dict[str, Any]:
+def session_updated(
+    session_id: str,
+    model: str,
+    backend: str = "echobridge-mock",
+    voice: str | None = None,
+    voice_name: str | None = None,
+    voice_fallback: bool | None = None,
+) -> dict[str, Any]:
     return {
         "type": SESSION_UPDATED,
-        "session": {"id": session_id, "model": model, "backend": backend},
+        "session": _session_payload(
+            session_id, model, backend, voice, voice_name, voice_fallback
+        ),
     }
 
 

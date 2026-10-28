@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import zlib
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -19,8 +20,11 @@ import httpx
 from .audio import load_wav_mono_24k, silence_pcm16, tone_pcm16
 from .config import Settings
 from .logging import get_logger
+from .voices import VoiceRegistry, VoiceSpec, load_voice_registry
 
 logger = get_logger("echobridge.tts")
+
+GREETING = "你来啦，我在呢。"
 
 
 class TTSBackend(Protocol):
@@ -32,16 +36,27 @@ class TTSBackend(Protocol):
 
     async def warmup(self) -> None: ...
 
+    async def ensure_warm(self, voice_id: str) -> None: ...
+
     async def close(self) -> None: ...
 
 
 class MockTTS:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, registry: VoiceRegistry | None = None
+    ) -> None:
         self._settings = settings
+        self._registry = registry or load_voice_registry(settings)
         self._first_chunk_delay = max(0, settings.tts_first_chunk_ms) / 1000.0
         self._wav: bytes | None = None
         if settings.mock_tts_wav:
             self._wav = load_wav_mono_24k(settings.mock_tts_wav)
+
+    def _note_offset(self, voice_id: str) -> int:
+        spec, _ = self._registry.resolve(voice_id)
+        # Shift the pentatonic sequence per voice so mock sessions can be
+        # distinguished by ear (and by byte comparison in tests).
+        return (zlib.crc32(spec.id.encode("utf-8")) >> 3) % 5
 
     async def synthesize(
         self, text: str, voice_id: str, generation: int
@@ -57,6 +72,7 @@ class MockTTS:
                 text,
                 sample_rate=24_000,
                 char_ms=self._settings.tts_tone_char_ms,
+                note_offset=self._note_offset(voice_id),
             )
         pcm += silence_pcm16(60, 24_000)
         block = 4_800
@@ -73,9 +89,13 @@ class MockTTS:
             text,
             sample_rate=24_000,
             char_ms=self._settings.tts_tone_char_ms,
+            note_offset=self._note_offset(voice_id),
         )
 
     async def warmup(self) -> None:
+        return None
+
+    async def ensure_warm(self, voice_id: str) -> None:
         return None
 
     async def close(self) -> None:
@@ -85,8 +105,11 @@ class MockTTS:
 class Qwen3TTSClient:
     """Sentence-level streaming client for the local Qwen3-TTS worker."""
 
-    def __init__(self, settings: Settings) -> None:
-        self._voice_id = settings.tts_voice_id
+    def __init__(
+        self, settings: Settings, registry: VoiceRegistry | None = None
+    ) -> None:
+        self._registry = registry or load_voice_registry(settings)
+        self._voice_id = self._registry.default_id
         self._backchannel_phrases = (
             settings.backchannel_phrases if settings.backchannel_enabled else ()
         )
@@ -97,13 +120,22 @@ class Qwen3TTSClient:
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
         self._backchannel_cache: dict[tuple[str, str], bytes] = {}
         self._cache_max = 8
+        self._warm_locks = {
+            spec.id: asyncio.Lock() for spec in self._registry.voices
+        }
+        self._warmed: set[str] = set()
+        self._warm_tasks: set[asyncio.Task[None]] = set()
+
+    def _resolve_voice(self, voice_id: str | None) -> str:
+        return self._registry.resolve(voice_id)[0].id
 
     def cached(self, text: str, voice_id: str) -> bytes | None:
-        key = (voice_id or self._voice_id, text.strip())
+        key = (self._resolve_voice(voice_id), text.strip())
         pinned = self._backchannel_cache.get(key)
         return pinned if pinned is not None else self._cache.get(key)
 
     async def _fetch(self, text: str, voice: str, generation: int = 0) -> bytes:
+        voice = self._resolve_voice(voice)
         key = (voice, text)
         cached = self._cache.get(key)
         if cached is not None:
@@ -129,32 +161,66 @@ class Qwen3TTSClient:
         text = text.strip()
         if not text:
             return
-        voice = voice_id or self._voice_id
-        pcm = await self._fetch(text, voice, generation)
+        pcm = await self._fetch(text, self._resolve_voice(voice_id), generation)
         block = 4_800  # 100 ms @ 24 kHz
         for offset in range(0, len(pcm), block):
             chunk = pcm[offset : offset + block]
             if chunk:
                 yield chunk
 
+    async def _warm_voice(self, voice: str) -> None:
+        voice = self._resolve_voice(voice)
+        if voice in self._warmed:
+            return
+        lock = self._warm_locks.setdefault(voice, asyncio.Lock())
+        async with lock:
+            if voice in self._warmed:
+                return
+            try:
+                pcm = await self._fetch(GREETING, voice)
+                if pcm:
+                    self._backchannel_cache[(voice, GREETING)] = pcm
+            except Exception as exc:
+                logger.warning("TTS greeting prewarm failed voice=%s: %s", voice, exc)
+            for phrase in self._backchannel_phrases:
+                try:
+                    pcm = await self._fetch(phrase, voice)
+                    if pcm:
+                        self._backchannel_cache[(voice, phrase)] = pcm
+                except Exception as exc:
+                    logger.warning(
+                        "TTS backchannel prewarm failed voice=%s phrase=%r: %s",
+                        voice,
+                        phrase,
+                        exc,
+                    )
+            self._warmed.add(voice)
+
+    def _schedule_background_warm(self) -> None:
+        for spec in self._registry.voices:
+            if spec.id in self._warmed:
+                continue
+            task = asyncio.create_task(
+                self._warm_voice(spec.id), name=f"tts-warm-{spec.id}"
+            )
+            self._warm_tasks.add(task)
+            task.add_done_callback(self._warm_tasks.discard)
+
     async def warmup(self) -> None:
         await self._client.get("/healthz")
-        greeting = "你来啦，我在呢。"
-        try:
-            pcm = await self._fetch(greeting, self._voice_id)
-            if pcm:
-                self._backchannel_cache[(self._voice_id, greeting)] = pcm
-        except Exception as exc:
-            logger.warning("TTS greeting prewarm failed: %s", exc)
-        for phrase in self._backchannel_phrases:
-            try:
-                pcm = await self._fetch(phrase, self._voice_id)
-                if pcm:
-                    self._backchannel_cache[(self._voice_id, phrase)] = pcm
-            except Exception as exc:
-                logger.warning("TTS backchannel prewarm failed phrase=%r: %s", phrase, exc)
+        await self._warm_voice(self._voice_id)
+        self._schedule_background_warm()
+
+    async def ensure_warm(self, voice_id: str) -> None:
+        await self._warm_voice(voice_id)
 
     async def close(self) -> None:
+        tasks = list(self._warm_tasks)
+        self._warm_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self._client.aclose()
 
 
@@ -166,24 +232,29 @@ class VLLMTTSClient:
     worker remains available as a reference implementation.
     """
 
-    def __init__(self, settings: Settings) -> None:
-        self._voice_id = settings.tts_voice_id
+    def __init__(
+        self, settings: Settings, registry: VoiceRegistry | None = None
+    ) -> None:
+        self._registry = registry or load_voice_registry(settings)
+        self._voice_id = self._registry.default_id
         self._backchannel_phrases = (
             settings.backchannel_phrases if settings.backchannel_enabled else ()
         )
-        ref_audio = Path(os.path.expanduser(settings.tts_ref_audio))
-        ref_text = Path(os.path.expanduser(settings.tts_ref_text))
-        if not ref_audio.exists():
-            raise FileNotFoundError(f"TTS reference audio missing: {ref_audio}")
-        if not ref_text.exists():
-            raise FileNotFoundError(f"TTS reference text missing: {ref_text}")
-        self._ref_text = ref_text.read_text(encoding="utf-8").strip()
-        if not self._ref_text:
-            raise ValueError("TTS reference text is empty")
-        self._ref_audio = (
-            "data:audio/wav;base64,"
-            + base64.b64encode(ref_audio.read_bytes()).decode("ascii")
-        )
+        self._voice_refs: dict[str, tuple[str, str]] = {}
+        for spec in self._registry.voices:
+            try:
+                self._voice_refs[spec.id] = self._encode_ref(spec)
+            except Exception as exc:
+                if spec.id == self._registry.default_id:
+                    raise
+                logger.warning(
+                    "TTS reference unavailable for voice %s: %s", spec.id, exc
+                )
+        if self._registry.default_id not in self._voice_refs:
+            raise FileNotFoundError(
+                f"TTS reference audio missing for default voice "
+                f"{self._registry.default_id}"
+            )
         self._client = httpx.AsyncClient(
             base_url=settings.tts_url,
             timeout=httpx.Timeout(settings.tts_timeout_s, connect=2.0),
@@ -192,8 +263,30 @@ class VLLMTTSClient:
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
         self._backchannel_cache: dict[tuple[str, str], bytes] = {}
         self._cache_max = 8
+        self._warm_locks = {
+            spec.id: asyncio.Lock() for spec in self._registry.voices
+        }
+        self._warmed: set[str] = set()
+        self._warm_tasks: set[asyncio.Task[None]] = set()
+
+    @staticmethod
+    def _encode_ref(spec: VoiceSpec) -> tuple[str, str]:
+        ref_audio = Path(os.path.expanduser(str(spec.ref_audio)))
+        if not ref_audio.is_file():
+            raise FileNotFoundError(f"TTS reference audio missing: {ref_audio}")
+        if not spec.ref_text:
+            raise ValueError("TTS reference text is empty")
+        encoded = base64.b64encode(ref_audio.read_bytes()).decode("ascii")
+        return f"data:audio/wav;base64,{encoded}", spec.ref_text
+
+    def _resolve_voice(self, voice_id: str | None) -> str:
+        return self._registry.resolve(voice_id)[0].id
 
     def _payload(self, text: str, voice: str) -> dict:
+        spec, _ = self._registry.resolve(voice)
+        ref = self._voice_refs.get(spec.id) or self._voice_refs[
+            self._registry.default_id
+        ]
         return {
             "input": text,
             "task_type": "Base",
@@ -201,8 +294,8 @@ class VLLMTTSClient:
             "response_format": "pcm",
             "stream": True,
             "stream_format": "audio",
-            "ref_audio": self._ref_audio,
-            "ref_text": self._ref_text,
+            "ref_audio": ref[0],
+            "ref_text": ref[1],
         }
 
     async def _stream(self, text: str, voice: str) -> AsyncIterator[bytes]:
@@ -231,7 +324,7 @@ class VLLMTTSClient:
         text = text.strip()
         if not text:
             return
-        voice = voice_id or self._voice_id
+        voice = self._resolve_voice(voice_id)
         key = (voice, text)
         cached = self._cache.get(key)
         if cached is not None:
@@ -250,11 +343,12 @@ class VLLMTTSClient:
                 self._cache.popitem(last=False)
 
     def cached(self, text: str, voice_id: str) -> bytes | None:
-        key = (voice_id or self._voice_id, text.strip())
+        key = (self._resolve_voice(voice_id), text.strip())
         pinned = self._backchannel_cache.get(key)
         return pinned if pinned is not None else self._cache.get(key)
 
     async def _prefetch(self, text: str, voice: str) -> bytes:
+        voice = self._resolve_voice(voice)
         key = (voice, text)
         cached = self._cache.get(key)
         if cached is not None:
@@ -271,37 +365,75 @@ class VLLMTTSClient:
                 self._cache.popitem(last=False)
         return pcm
 
+    async def _warm_voice(self, voice: str) -> None:
+        voice = self._resolve_voice(voice)
+        if voice in self._warmed:
+            return
+        lock = self._warm_locks.setdefault(voice, asyncio.Lock())
+        async with lock:
+            if voice in self._warmed:
+                return
+            # Pre-synthesize the fixed app greeting; this is silent and warms
+            # the talker/codec path so the first real greeting is cache-hit fast.
+            try:
+                pcm = await self._prefetch(GREETING, voice)
+                if pcm:
+                    # Pin the greeting so the 8-entry LRU for real replies
+                    # cannot evict it after a few turns.
+                    self._backchannel_cache[(voice, GREETING)] = pcm
+            except Exception as exc:
+                logger.warning("TTS greeting prewarm failed voice=%s: %s", voice, exc)
+            for phrase in self._backchannel_phrases:
+                try:
+                    pcm = await self._prefetch(phrase, voice)
+                    if pcm:
+                        self._backchannel_cache[(voice, phrase)] = pcm
+                except Exception as exc:
+                    logger.warning(
+                        "TTS backchannel prewarm failed voice=%s phrase=%r: %s",
+                        voice,
+                        phrase,
+                        exc,
+                    )
+            self._warmed.add(voice)
+
+    def _schedule_background_warm(self) -> None:
+        for spec in self._registry.voices:
+            if spec.id in self._warmed:
+                continue
+            task = asyncio.create_task(
+                self._warm_voice(spec.id), name=f"tts-warm-{spec.id}"
+            )
+            self._warm_tasks.add(task)
+            task.add_done_callback(self._warm_tasks.discard)
+
     async def warmup(self) -> None:
         try:
             await self._client.get("/health")
         except Exception:
             pass
-        # Pre-synthesize the fixed app greeting; this is silent and warms the
-        # talker/codec path so the first real greeting is cache-hit fast.
-        greeting = "你来啦，我在呢。"
-        try:
-            pcm = await self._prefetch(greeting, self._voice_id)
-            if pcm:
-                # Pin the greeting so the 8-entry LRU for real replies cannot
-                # evict it after a few turns.
-                self._backchannel_cache[(self._voice_id, greeting)] = pcm
-        except Exception as exc:
-            logger.warning("TTS greeting prewarm failed: %s", exc)
-        for phrase in self._backchannel_phrases:
-            try:
-                pcm = await self._prefetch(phrase, self._voice_id)
-                if pcm:
-                    self._backchannel_cache[(self._voice_id, phrase)] = pcm
-            except Exception as exc:
-                logger.warning("TTS backchannel prewarm failed phrase=%r: %s", phrase, exc)
+        await self._warm_voice(self._voice_id)
+        self._schedule_background_warm()
+
+    async def ensure_warm(self, voice_id: str) -> None:
+        await self._warm_voice(voice_id)
 
     async def close(self) -> None:
+        tasks = list(self._warm_tasks)
+        self._warm_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self._client.aclose()
 
 
-def make_tts(settings: Settings) -> TTSBackend:
+def make_tts(
+    settings: Settings, registry: VoiceRegistry | None = None
+) -> TTSBackend:
+    registry = registry or load_voice_registry(settings)
     if settings.tts_backend == "vllm":
-        return VLLMTTSClient(settings)
+        return VLLMTTSClient(settings, registry)
     if settings.tts_backend == "qwen3":
-        return Qwen3TTSClient(settings)
-    return MockTTS(settings)
+        return Qwen3TTSClient(settings, registry)
+    return MockTTS(settings, registry)

@@ -1,0 +1,26 @@
+{
+  "default": "mingyue_v1",
+  "voices": [
+    {
+      "id": "mingyue_v1",
+      "name": "月月",
+      "description": "温暖自然，默认声线",
+      "ref_audio": "candidate_3.wav",
+      "ref_text_file": "reference.txt"
+    },
+    {
+      "id": "mingyue_xixi_v1",
+      "name": "汐汐",
+      "description": "明亮活泼，音调偏高",
+      "ref_audio": "candidate_1.wav",
+      "ref_text_file": "reference.txt"
+    },
+    {
+      "id": "mingyue_nuonuo_v1",
+      "name": "糯糯",
+      "description": "软糯温柔，音量偏轻",
+      "ref_audio": "candidate_2.wav",
+      "ref_text_file": "reference.txt"
+    }
+  ]
+}

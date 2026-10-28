@@ -31,6 +31,7 @@ from .text import is_stop_command, split_for_tts
 from .tools import available_tool_names, convert_tools
 from .tts import TTSBackend
 from .vad import VADBackend, VADEvent, make_vad
+from .voices import VoiceRegistry, load_voice_registry
 
 logger = get_logger("echobridge.session")
 
@@ -55,12 +56,14 @@ class Session:
         asr: ASRBackend | None = None,
         vad: VADBackend | None = None,
         tts: TTSBackend | None = None,
+        voice_registry: VoiceRegistry | None = None,
     ) -> None:
         self._ws = ws
         self._settings = settings
         self._session_id = session_id or f"sess_{uuid.uuid4().hex[:12]}"
         self._device_id = device_id
         self._mock_asr_text = (mock_asr_text or settings.mock_asr_text).strip()
+        self._voice_registry = voice_registry or load_voice_registry(settings)
 
         self._send_lock = asyncio.Lock()
         self._closed = False
@@ -69,7 +72,11 @@ class Session:
 
         self._model = "unknown"
         self._instructions = ""
-        self._voice = ""
+        default_voice = self._voice_registry.resolve(None)[0]
+        self._voice = default_voice.id
+        self._voice_name = default_voice.name
+        self._voice_fallback = False
+        self._voice_warm_task: asyncio.Task[None] | None = None
         self._tools_volc: list[dict[str, Any]] = []
         self._tools_openai: list[dict[str, Any]] = []
         self._tool_names: set[str] = set()
@@ -100,7 +107,7 @@ class Session:
         self._deepseek = DeepSeekLLM(settings) if settings.llm_backend == "deepseek" else None
         from .tts import make_tts
 
-        self._tts = tts or make_tts(settings)
+        self._tts = tts or make_tts(settings, self._voice_registry)
         self._asr = asr or MockASR(self._mock_asr_text)
         self._vad = vad or make_vad(settings)
 
@@ -156,6 +163,7 @@ class Session:
             return
         self._closing = True
         self._discard_speculative_asr()
+        self._cancel_voice_warm()
         await self._cancel_active(send_canceled=False, reason=f"close:{reason}")
         self._vad.reset()
         if not self._closed:
@@ -203,11 +211,17 @@ class Session:
             return
         self._model = str(session.get("model") or "unknown")
         self._instructions = str(session.get("instructions") or "")
+        raw_voice: str | None = None
         audio = session.get("audio")
         if isinstance(audio, dict):
             output = audio.get("output")
-            if isinstance(output, dict):
-                self._voice = str(output.get("voice") or "")
+            if isinstance(output, dict) and output.get("voice") is not None:
+                value = output.get("voice")
+                raw_voice = value if isinstance(value, str) else str(value)
+        spec, fallback = self._voice_registry.resolve(raw_voice)
+        self._voice = spec.id
+        self._voice_name = spec.name
+        self._voice_fallback = fallback
         tools = session.get("tools")
         self._tools_volc = tools if isinstance(tools, list) else []
         self._tools_openai = convert_tools(self._tools_volc)
@@ -216,17 +230,35 @@ class Session:
         self._created = True
         self._vad.reset()
         await self._send(
-            protocol.session_created(self._session_id, self._model, "echobridge-mock")
+            protocol.session_created(
+                self._session_id,
+                self._model,
+                "echobridge-mock",
+                voice=self._voice,
+                voice_name=self._voice_name,
+                voice_fallback=self._voice_fallback,
+            )
         )
         await self._send(
-            protocol.session_updated(self._session_id, self._model, "echobridge-mock")
+            protocol.session_updated(
+                self._session_id,
+                self._model,
+                "echobridge-mock",
+                voice=self._voice,
+                voice_name=self._voice_name,
+                voice_fallback=self._voice_fallback,
+            )
         )
+        self._schedule_voice_warm()
         logger.info(
-            "session created id=%s device=%s model=%s voice=%s tools=%d filtered=%d",
+            "session created id=%s device=%s model=%s voice=%s voice_name=%s "
+            "fallback=%s tools=%d filtered=%d",
             self._session_id,
             self._device_id,
             self._model,
-            self._voice or "-",
+            self._voice,
+            self._voice_name,
+            "1" if self._voice_fallback else "0",
             len(self._tools_openai),
             len(self._tools_volc) - len(self._tools_openai),
         )
@@ -418,6 +450,22 @@ class Session:
             task.exception()
         except BaseException:
             pass
+
+    def _schedule_voice_warm(self) -> None:
+        ensure_warm = getattr(self._tts, "ensure_warm", None)
+        if ensure_warm is None:
+            return
+        self._cancel_voice_warm()
+        self._voice_warm_task = asyncio.create_task(
+            ensure_warm(self._voice), name=f"tts-warm-{self._voice}"
+        )
+        self._voice_warm_task.add_done_callback(self._consume_task_exception)
+
+    def _cancel_voice_warm(self) -> None:
+        task = self._voice_warm_task
+        self._voice_warm_task = None
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _handle_tool_results(self, event: dict[str, Any]) -> None:
         for result in protocol.extract_tool_results(event):
@@ -862,6 +910,7 @@ class Session:
 
     async def _shutdown(self) -> None:
         self._discard_speculative_asr()
+        self._cancel_voice_warm()
         self._vad.reset()
         if not self._closed:
             await self._cancel_active(send_canceled=False, reason="shutdown")

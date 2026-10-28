@@ -77,6 +77,11 @@ class Settings:
     tts_url: str = "http://127.0.0.1:18802"
     tts_timeout_s: float = 30.0
     tts_voice_id: str = "mingyue_v1"
+    # Voice registry.  ``tts_voice_registry`` is optional; when empty the
+    # gateway uses ``<tts_voice_dir>/voices.json``.  The legacy ref_audio/
+    # ref_text pair remains the fallback when the registry is missing or bad.
+    tts_voice_dir: str = "~/.cache/echobridge/voices/mingyue"
+    tts_voice_registry: str = ""
     tts_ref_audio: str = "~/.cache/echobridge/voices/mingyue/reference.wav"
     tts_ref_text: str = "~/.cache/echobridge/voices/mingyue/reference.txt"
     tts_api_key: str = "EMPTY"
@@ -155,6 +160,14 @@ class Settings:
             tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),
             tts_voice_id=os.environ.get("ECHOBRIDGE_TTS_VOICE_ID", "mingyue_v1").strip()
             or "mingyue_v1",
+            tts_voice_dir=os.environ.get(
+                "ECHOBRIDGE_TTS_VOICE_DIR",
+                "~/.cache/echobridge/voices/mingyue",
+            ).strip()
+            or "~/.cache/echobridge/voices/mingyue",
+            tts_voice_registry=os.environ.get(
+                "ECHOBRIDGE_TTS_VOICE_REGISTRY", ""
+            ).strip(),
             tts_ref_audio=os.environ.get(
                 "ECHOBRIDGE_TTS_REF_AUDIO",
                 "~/.cache/echobridge/voices/mingyue/reference.wav",

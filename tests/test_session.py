@@ -6,16 +6,18 @@ import base64
 from echobridge.config import Settings
 from echobridge.protocol import dumps
 from echobridge.session import Session
+from echobridge.voices import VoiceRegistry
 from tests.fakes import FakeWebSocket
 from tests.helpers import (
     ask_expert_tool,
     get_time_tool,
     loud_frame,
+    make_settings,
+    make_voice_registry,
     play_animation_tool,
     session_create,
     set_emotion_tool,
     silence_frame,
-    make_settings,
 )
 
 
@@ -24,6 +26,9 @@ async def start_session(
     mock_asr_text: str = "你好呀，溟月",
     tools: list[dict] | None = None,
     settings: Settings | None = None,
+    voice_registry: VoiceRegistry | None = None,
+    voice: str | None = "mingyue_v1",
+    include_voice: bool = True,
 ) -> tuple[FakeWebSocket, Session, asyncio.Task[None]]:
     ws = FakeWebSocket()
     session = Session(
@@ -31,9 +36,12 @@ async def start_session(
         settings or make_settings(),
         device_id="test-device",
         mock_asr_text=mock_asr_text,
+        voice_registry=voice_registry,
     )
     task = asyncio.create_task(session.run())
-    await ws.push(session_create(tools or []))
+    await ws.push(
+        session_create(tools or [], voice=voice, include_voice=include_voice)
+    )
     await ws.wait_for_type("session.created")
     return ws, session, task
 
@@ -276,3 +284,61 @@ async def test_session_close_sends_closed_and_stops():
     finally:
         if not session.closed:
             await stop_session(ws, session, task)
+
+
+async def test_session_created_echoes_resolved_voice(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    ws, session, task = await start_session(
+        voice_registry=registry, voice="mingyue_xixi_v1"
+    )
+    try:
+        created = ws.events("session.created")[0]["session"]
+        updated = ws.events("session.updated")[0]["session"]
+        assert created["voice"] == "mingyue_xixi_v1"
+        assert created["voice_name"] == "汐汐"
+        assert created["voice_fallback"] is False
+        assert updated["voice"] == "mingyue_xixi_v1"
+        assert updated["voice_name"] == "汐汐"
+        assert updated["voice_fallback"] is False
+        assert session._voice == "mingyue_xixi_v1"
+    finally:
+        await stop_session(ws, session, task)
+
+
+async def test_unknown_voice_falls_back_to_default(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    ws, session, task = await start_session(
+        voice_registry=registry, voice="unknown_voice"
+    )
+    try:
+        created = ws.events("session.created")[0]["session"]
+        assert created["voice"] == registry.default_id
+        assert created["voice_name"] == "月月"
+        assert created["voice_fallback"] is True
+        assert session._voice == registry.default_id
+    finally:
+        await stop_session(ws, session, task)
+
+
+async def test_empty_voice_uses_default_without_fallback(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    ws, session, task = await start_session(voice_registry=registry, voice="")
+    try:
+        created = ws.events("session.created")[0]["session"]
+        assert created["voice"] == registry.default_id
+        assert created["voice_fallback"] is False
+    finally:
+        await stop_session(ws, session, task)
+
+
+async def test_absent_voice_uses_default_without_fallback(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    ws, session, task = await start_session(
+        voice_registry=registry, include_voice=False
+    )
+    try:
+        created = ws.events("session.created")[0]["session"]
+        assert created["voice"] == registry.default_id
+        assert created["voice_fallback"] is False
+    finally:
+        await stop_session(ws, session, task)

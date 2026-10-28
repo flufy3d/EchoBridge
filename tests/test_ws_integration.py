@@ -77,6 +77,33 @@ async def test_health_and_probe():
         await stop_server(server, task)
 
 
+async def test_voices_endpoint_requires_bearer_token():
+    settings = make_settings()
+    server, task, port = await start_server(settings)
+    try:
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+            unauthorized = await client.get("/voices")
+            assert unauthorized.status_code == 401
+            wrong = await client.get(
+                "/voices", headers={"Authorization": "Bearer wrong"}
+            )
+            assert wrong.status_code == 401
+
+            response = await client.get(
+                "/voices",
+                headers={"Authorization": f"Bearer {settings.token}"},
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["default"] == "mingyue_v1"
+            assert payload["voices"][0]["id"] == "mingyue_v1"
+            assert payload["voices"][0]["default"] is True
+            assert "ref_audio" not in response.text
+            assert "reference.wav" not in response.text
+    finally:
+        await stop_server(server, task)
+
+
 @pytest.mark.parametrize(
     ("headers", "subprotocols", "expected"),
     [

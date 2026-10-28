@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import math
 import struct
+import wave
+from pathlib import Path
 
 from echobridge.config import Settings
+from echobridge.voices import VoiceRegistry, VoiceSpec
 
 
 def make_settings(**overrides) -> Settings:
@@ -19,9 +22,71 @@ def make_settings(**overrides) -> Settings:
         tts_tone_char_ms=8,
         tool_timeout_s=3.0,
         enable_probe=True,
+        # Never read the production voice registry from unit tests.
+        tts_voice_dir="/nonexistent/echobridge-test-voices",
+        tts_voice_registry="",
+        tts_ref_audio="/nonexistent/echobridge-test-voices/reference.wav",
+        tts_ref_text="/nonexistent/echobridge-test-voices/reference.txt",
     )
     base.update(overrides)
     return Settings(**base)
+
+
+def write_wav(
+    path: str | Path,
+    *,
+    sample_rate: int = 16_000,
+    duration_ms: int = 20,
+    frequency: float = 440.0,
+    amplitude: float = 0.2,
+) -> Path:
+    """Write a tiny valid PCM16 mono WAV for registry/TTS fixtures."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame_count = max(1, int(sample_rate * duration_ms / 1000))
+    samples = [
+        int(amplitude * 32767 * math.sin(2 * math.pi * frequency * i / sample_rate))
+        for i in range(frame_count)
+    ]
+    with wave.open(str(target), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(struct.pack(f"<{frame_count}h", *samples))
+    return target
+
+
+def make_voice_registry(
+    tmp_path: str | Path,
+    *,
+    ids: tuple[str, ...] = ("mingyue_v1", "mingyue_xixi_v1", "mingyue_nuonuo_v1"),
+    default_id: str = "mingyue_v1",
+) -> VoiceRegistry:
+    """Create a registry whose reference files exist in ``tmp_path``."""
+    base = Path(tmp_path)
+    names = {
+        "mingyue_v1": "月月",
+        "mingyue_xixi_v1": "汐汐",
+        "mingyue_nuonuo_v1": "糯糯",
+    }
+    specs = []
+    for index, voice_id in enumerate(ids):
+        audio = write_wav(
+            base / f"{voice_id}.wav", frequency=220.0 + index * 110.0
+        )
+        text = base / f"{voice_id}.txt"
+        text.write_text(f"参考文本 {voice_id}", encoding="utf-8")
+        specs.append(
+            VoiceSpec(
+                id=voice_id,
+                name=names.get(voice_id, voice_id),
+                description=f"test voice {index}",
+                ref_audio=audio,
+                ref_text=text.read_text(encoding="utf-8"),
+                default=voice_id == default_id,
+            )
+        )
+    return VoiceRegistry(tuple(specs), default_id)
 
 
 def loud_frame(amplitude: int = 9000) -> bytes:
@@ -37,7 +102,17 @@ def silence_frame() -> bytes:
     return b"\x00" * 640
 
 
-def session_create(tools: list[dict] | None = None) -> dict:
+def session_create(
+    tools: list[dict] | None = None,
+    *,
+    voice: str | None = "mingyue_v1",
+    include_voice: bool = True,
+) -> dict:
+    output = {
+        "format": {"type": "pcm_s16le", "rate": 24000},
+    }
+    if include_voice:
+        output["voice"] = voice if voice is not None else ""
     return {
         "type": "session.create",
         "event_id": "event_create",
@@ -46,10 +121,7 @@ def session_create(tools: list[dict] | None = None) -> dict:
             "instructions": "",
             "audio": {
                 "input": {"format": {"type": "pcm", "rate": 16000}},
-                "output": {
-                    "format": {"type": "pcm_s16le", "rate": 24000},
-                    "voice": "mingyue_v1",
-                },
+                "output": output,
             },
             "tools": tools or [],
         },

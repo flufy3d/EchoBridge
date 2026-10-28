@@ -117,12 +117,14 @@ def tone_pcm16(
     char_ms: int = 55,
     gap_ms: int = 8,
     amplitude: float = 0.18,
+    note_offset: int = 0,
 ) -> bytes:
     """Generate a short, pleasant, speech-length tone sequence.
 
     This is a transport test signal, not speech.  Each non-space character gets
     one plucked note; punctuation gets a lower note.  The result has clean fades
-    so the device's speaker path can be checked for clicks/pops.
+    so the device's speaker path can be checked for clicks/pops.  ``note_offset``
+    shifts the pentatonic sequence so mock voices are audibly distinct.
     """
     if not text:
         return b""
@@ -135,7 +137,9 @@ def tone_pcm16(
         if char.isspace():
             base = 0.0
         else:
-            base = _PENTATONIC[(ord(char) + index) % len(_PENTATONIC)]
+            base = _PENTATONIC[
+                (ord(char) + index + note_offset) % len(_PENTATONIC)
+            ]
             if char in "。！？!?；;，,、":
                 base *= 0.75
         if base <= 0.0:
