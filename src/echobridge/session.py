@@ -36,6 +36,17 @@ from .voices import VoiceRegistry, load_voice_registry
 logger = get_logger("echobridge.session")
 
 
+def _as_bool(value: Any) -> bool:
+    """Read the loose booleans used by the app's session.create extension."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
 class WebSocketLike(Protocol):
     async def receive_text(self) -> str: ...
 
@@ -84,6 +95,14 @@ class Session:
         # (including an empty one) comes from this session's session.create.
         self._session_hotwords: tuple[str, ...] | None = None
         self._session_asr_context: str | None = None
+        # Full duplex: the app keeps streaming real microphone audio while TTS
+        # plays (hardware AEC).  Default false keeps half-duplex clients on the
+        # old "ignore audio during response" path.
+        self._full_duplex = bool(settings.full_duplex)
+        self._input_aec = ""
+        # Set when the app's own RMS barge-in canceled a response and asked us
+        # to keep the in-progress VAD segment.  Used only for logging/metrics.
+        self._barge_in_ctx: protocol.ResponseContext | None = None
 
         self._event_seq = 0
         self._generation = 0
@@ -194,11 +213,50 @@ class Session:
         elif event_type == protocol.ITEM_CREATE:
             await self._handle_tool_results(event)
         elif event_type == protocol.RESPONSE_CANCEL:
-            await self._cancel_active(send_canceled=True, reason="client")
+            await self._handle_response_cancel(event)
         elif event_type == protocol.SESSION_CLOSE:
             await self.close("client")
         else:
             logger.debug("unhandled upstream event %s", event_type)
+
+    async def _handle_response_cancel(self, event: dict[str, Any]) -> None:
+        raw_reason = event.get("reason")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        requested = event.get("response_id")
+        active = self._active_ctx
+        if (
+            isinstance(requested, str)
+            and requested
+            and active is not None
+            and requested != active.response_id
+        ):
+            # A late cancel for an old response must not kill the new one.
+            logger.debug(
+                "ignoring stale response.cancel requested=%s active=%s",
+                requested,
+                active.response_id,
+            )
+            return
+
+        # App-side RMS barge-in: keep the VAD segment that started before the
+        # cancel.  Old apps send no reason; preserve an active segment too.
+        preserve = reason == "barge_in"
+        if not reason and self._vad.active:
+            preserve = True
+        old = await self._cancel_active(
+            send_canceled=True,
+            reason=reason or "client",
+            reset_vad=not preserve,
+        )
+        if preserve and old is not None:
+            self._barge_in_ctx = old
+        if reason == "tap":
+            # Tap is an explicit abandonment.  Even if a barge-in already
+            # canceled the response, drop the residual VAD/speculative ASR so
+            # it cannot start a new turn.
+            self._discard_speculative_asr()
+            self._vad.reset()
+            self._barge_in_ctx = None
 
     async def _handle_session_create(self, event: dict[str, Any]) -> None:
         if self._created:
@@ -227,6 +285,7 @@ class Session:
         self._tools_openai = convert_tools(self._tools_volc)
         self._tool_names = available_tool_names(self._tools_openai)
         self._apply_asr_extension(event, session)
+        self._apply_audio_extension(event, session)
         self._created = True
         self._vad.reset()
         await self._send(
@@ -252,7 +311,7 @@ class Session:
         self._schedule_voice_warm()
         logger.info(
             "session created id=%s device=%s model=%s voice=%s voice_name=%s "
-            "fallback=%s tools=%d filtered=%d",
+            "fallback=%s tools=%d filtered=%d full_duplex=%s aec=%s",
             self._session_id,
             self._device_id,
             self._model,
@@ -261,6 +320,8 @@ class Session:
             "1" if self._voice_fallback else "0",
             len(self._tools_openai),
             len(self._tools_volc) - len(self._tools_openai),
+            "1" if self._full_duplex else "0",
+            self._input_aec or "-",
         )
 
     def _apply_asr_extension(
@@ -297,6 +358,49 @@ class Session:
                     self._session_asr_context = context.strip()[:400]
                 return
 
+    def _apply_audio_extension(
+        self, event: dict[str, Any], session: dict[str, Any]
+    ) -> None:
+        """Read full-duplex input capabilities from session.create.
+
+        The app advertises them as::
+
+            extension.audio.input.full_duplex = true
+            extension.audio.input.aec = "hw-xmvoip"
+
+        Older clients omit both fields, so the default remains half duplex.
+        ``ECHOBRIDGE_FULL_DUPLEX=1`` is an explicit gateway-side override for
+        testing before the app ships the extension.
+        """
+        detected = False
+        aec = ""
+
+        def read_input(container: dict[str, Any]) -> None:
+            nonlocal detected, aec
+            audio = container.get("audio")
+            if not isinstance(audio, dict):
+                return
+            input_cfg = audio.get("input")
+            if not isinstance(input_cfg, dict):
+                return
+            if _as_bool(input_cfg.get("full_duplex")):
+                detected = True
+            value = input_cfg.get("aec")
+            if isinstance(value, str) and value.strip():
+                aec = value.strip()
+
+        for container in (event, session):
+            if not isinstance(container, dict):
+                continue
+            extension = container.get("extension")
+            if isinstance(extension, dict):
+                read_input(extension)
+            # Tolerate clients that put the flags directly under session.audio.
+            read_input(container)
+
+        self._full_duplex = bool(self._settings.full_duplex or detected)
+        self._input_aec = aec
+
     async def _transcribe_pcm(self, pcm: bytes):
         if self._session_asr_context is None:
             return await self._asr.transcribe(pcm, 16000)
@@ -307,10 +411,13 @@ class Session:
     async def _handle_audio(self, event: dict[str, Any]) -> None:
         if not self._created or self._closed:
             return
-        if self._response_active:
+        if self._response_active and not self._full_duplex:
             # Half duplex: the device sends zero frames while TTS plays.  Do not
             # run turn detection on those frames.
             return
+        # Full duplex (hardware AEC) keeps streaming real microphone audio.
+        # Feed it to VAD during the response so a barge-in segment includes the
+        # first word even before the app sends response.cancel.
         encoded = protocol.extract_audio(event)
         if not encoded:
             return
@@ -326,14 +433,29 @@ class Session:
 
     async def _handle_vad_event(self, event: VADEvent) -> None:
         if event.kind == "started":
-            await self._send(protocol.asr_started(event.item_id))
+            # While a response is playing, keep accumulating audio but do not
+            # tell the app: asr.started makes it flush local TTS.  A short
+            # cough must not interrupt the answer; the app's RMS barge-in or
+            # our own final below decides whether to cancel.
+            if not self._response_active:
+                await self._send(protocol.asr_started(event.item_id))
         elif event.kind == "delta":
-            await self._send(protocol.asr_delta(event.item_id, event.text))
+            if not self._response_active:
+                await self._send(protocol.asr_delta(event.item_id, event.text))
         elif event.kind == "early":
             self._start_speculative_asr(event)
         elif event.kind == "resume":
             self._discard_speculative_asr()
         elif event.kind == "final":
+            # Capture whether this final belongs to a barge-in.  The app-side
+            # response.cancel(reason=barge_in) leaves a marker while our own
+            # cancel path uses the still-active response.
+            old_response_active = self._response_active
+            barge_ctx = (
+                self._active_ctx if old_response_active else self._barge_in_ctx
+            )
+            app_canceled = not old_response_active and barge_ctx is not None
+            self._barge_in_ctx = None
             if not event.pcm or event.speech_ms < self._settings.vad_min_speech_ms:
                 self._discard_speculative_asr()
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
@@ -386,12 +508,71 @@ class Session:
                 logger.info(
                     "stop command item=%s chars=%d", event.item_id, len(text)
                 )
+                if self._response_active:
+                    await self._cancel_active(
+                        send_canceled=True, reason="barge_in", reset_vad=True
+                    )
+                    self._log_barge_in(
+                        barge_ctx,
+                        speech_ms=event.speech_ms,
+                        asr_ms=asr_wall_ms,
+                        reset_vad=True,
+                        app_canceled=False,
+                    )
+                    return
+                if app_canceled:
+                    self._log_barge_in(
+                        barge_ctx,
+                        speech_ms=event.speech_ms,
+                        asr_ms=asr_wall_ms,
+                        reset_vad=False,
+                        app_canceled=True,
+                    )
                 ctx = self._begin_response()
                 self._turn_started_at = None
                 await self._send(protocol.response_done(ctx, "stopped"), ctx=ctx)
                 self._finish_response(ctx)
                 return
+            if self._response_active:
+                await self._cancel_active(
+                    send_canceled=True, reason="barge_in", reset_vad=True
+                )
+                self._log_barge_in(
+                    barge_ctx,
+                    speech_ms=event.speech_ms,
+                    asr_ms=asr_wall_ms,
+                    reset_vad=True,
+                    app_canceled=False,
+                )
+            elif app_canceled:
+                self._log_barge_in(
+                    barge_ctx,
+                    speech_ms=event.speech_ms,
+                    asr_ms=asr_wall_ms,
+                    reset_vad=False,
+                    app_canceled=True,
+                )
             await self._start_turn(text)
+
+    def _log_barge_in(
+        self,
+        ctx: protocol.ResponseContext | None,
+        *,
+        speech_ms: int,
+        asr_ms: float,
+        reset_vad: bool,
+        app_canceled: bool,
+    ) -> None:
+        # Do not log audio/text: only timing and who initiated the cancel.
+        logger.info(
+            "barge_in response=%s reason=barge_in speech_ms=%d asr_ms=%.1f "
+            "reset_vad=%s app_canceled=%s",
+            ctx.response_id if ctx is not None else "-",
+            speech_ms,
+            asr_ms,
+            "1" if reset_vad else "0",
+            "1" if app_canceled else "0",
+        )
 
     async def _handle_speech(self, event: dict[str, Any]) -> None:
         speech_id = str(event.get("speech_id") or "default")
@@ -575,6 +756,18 @@ class Session:
             phrases = list(self._settings.backchannel_phrases)
         return random.choice(phrases)
 
+    def _reset_vad_at_response_boundary(self) -> None:
+        """Reset VAD only for half-duplex clients.
+
+        In full duplex the microphone stream is continuous.  A response can
+        finish (or start another tool hop) while the user has already begun
+        speaking; resetting here would drop the first 100-200 ms of the
+        barge-in.  Explicit cancels still reset when requested (tap/client).
+        """
+        if self._full_duplex:
+            return
+        self._vad.reset()
+
     def _begin_response(self) -> protocol.ResponseContext:
         self._generation += 1
         ctx = protocol.ResponseContext(
@@ -582,7 +775,8 @@ class Session:
         )
         self._active_ctx = ctx
         self._response_active = True
-        self._vad.reset()
+        self._barge_in_ctx = None
+        self._reset_vad_at_response_boundary()
         return ctx
 
     async def _run_turn(self, ctx: protocol.ResponseContext, transcript: str) -> None:
@@ -821,13 +1015,24 @@ class Session:
             return True
         return len(buffer) >= limit
 
-    async def _cancel_active(self, *, send_canceled: bool, reason: str) -> None:
-        self._discard_speculative_asr()
-        self._cancel_backchannel()
-        self._turn_started_at = None
+    async def _cancel_active(
+        self,
+        *,
+        send_canceled: bool,
+        reason: str,
+        reset_vad: bool = True,
+    ) -> protocol.ResponseContext | None:
         old = self._active_ctx
         if old is None and not self._response_active:
-            return
+            # Idempotent: a second cancel (app + gateway racing) must not emit
+            # response.canceled again or disturb a preserved VAD segment.
+            return None
+        self._cancel_backchannel()
+        self._turn_started_at = None
+        if reset_vad:
+            # A preserved segment may still reuse its in-flight speculative
+            # ASR result at final.
+            self._discard_speculative_asr()
         self._generation += 1
         self._response_active = False
         pacer = self._pacer
@@ -841,20 +1046,26 @@ class Session:
             wait_for.append(task)
         if pacer is not None and pacer.task is not None:
             wait_for.append(pacer.task)
+        # Detach before awaiting: the cancelled task's finally calls
+        # _finish_response(), which must not reset a VAD segment that an
+        # app-side barge-in asked us to preserve.
+        self._active_ctx = None
         if wait_for:
             await asyncio.gather(*wait_for, return_exceptions=True)
-        self._active_ctx = None
         self._response_task = None
         self._pacer = None
         self._pending_tools.clear()
-        self._vad.reset()
+        if reset_vad:
+            self._vad.reset()
         logger.info(
-            "response canceled response=%s reason=%s",
+            "response canceled response=%s reason=%s reset_vad=%s",
             old.response_id if old else "-",
             reason,
+            "1" if reset_vad else "0",
         )
         if send_canceled and old is not None and not self._closed:
             await self._send(protocol.response_canceled(old), force=True)
+        return old
 
     def _finish_response(self, ctx: protocol.ResponseContext) -> None:
         self._cancel_backchannel()
@@ -871,7 +1082,7 @@ class Session:
         self._response_task = None
         self._pacer = None
         self._pending_tools.clear()
-        self._vad.reset()
+        self._reset_vad_at_response_boundary()
 
     # ------------------------------------------------------------------
     # Downstream send

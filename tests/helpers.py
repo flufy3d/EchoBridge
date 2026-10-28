@@ -107,12 +107,26 @@ def session_create(
     *,
     voice: str | None = "mingyue_v1",
     include_voice: bool = True,
+    full_duplex: bool | None = None,
+    aec: str | None = None,
 ) -> dict:
     output = {
         "format": {"type": "pcm_s16le", "rate": 24000},
     }
     if include_voice:
         output["voice"] = voice if voice is not None else ""
+    extension = {
+        "asr": {"extra": {}},
+        "tts": {"extra": {}},
+        "dialog": {"extra": {"enable_loudness_norm": True}},
+    }
+    if full_duplex is not None or aec is not None:
+        input_extension: dict = {}
+        if full_duplex is not None:
+            input_extension["full_duplex"] = full_duplex
+        if aec is not None:
+            input_extension["aec"] = aec
+        extension["audio"] = {"input": input_extension}
     return {
         "type": "session.create",
         "event_id": "event_create",
@@ -125,11 +139,7 @@ def session_create(
             },
             "tools": tools or [],
         },
-        "extension": {
-            "asr": {"extra": {}},
-            "tts": {"extra": {}},
-            "dialog": {"extra": {"enable_loudness_norm": True}},
-        },
+        "extension": extension,
     }
 
 

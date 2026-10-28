@@ -29,6 +29,9 @@ async def start_session(
     voice_registry: VoiceRegistry | None = None,
     voice: str | None = "mingyue_v1",
     include_voice: bool = True,
+    full_duplex: bool | None = None,
+    aec: str | None = None,
+    asr=None,
 ) -> tuple[FakeWebSocket, Session, asyncio.Task[None]]:
     ws = FakeWebSocket()
     session = Session(
@@ -37,10 +40,17 @@ async def start_session(
         device_id="test-device",
         mock_asr_text=mock_asr_text,
         voice_registry=voice_registry,
+        asr=asr,
     )
     task = asyncio.create_task(session.run())
     await ws.push(
-        session_create(tools or [], voice=voice, include_voice=include_voice)
+        session_create(
+            tools or [],
+            voice=voice,
+            include_voice=include_voice,
+            full_duplex=full_duplex,
+            aec=aec,
+        )
     )
     await ws.wait_for_type("session.created")
     return ws, session, task

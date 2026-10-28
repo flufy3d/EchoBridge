@@ -65,6 +65,10 @@ class Settings:
     vad_start_ms: int = 64
     silero_threshold: float = 0.5
     silero_model: str | None = None
+    # Force full-duplex input handling even when session.create does not
+    # advertise extension.audio.input.full_duplex.  Used by tests and for
+    # devices that have not shipped the extension yet.
+    full_duplex: bool = False
 
     asr_backend: str = "mock"
     asr_url: str = "http://127.0.0.1:18801"
@@ -153,6 +157,7 @@ class Settings:
             vad_start_ms=_env_int("ECHOBRIDGE_VAD_START_MS", 64),
             silero_threshold=float(os.environ.get("ECHOBRIDGE_SILERO_THRESHOLD", "0.5")),
             silero_model=os.environ.get("ECHOBRIDGE_SILERO_MODEL") or None,
+            full_duplex=_env_bool("ECHOBRIDGE_FULL_DUPLEX", False),
             asr_backend=os.environ.get("ECHOBRIDGE_ASR_BACKEND", "mock").strip().lower(),
             asr_url=os.environ.get("ECHOBRIDGE_ASR_URL", "http://127.0.0.1:18801").rstrip("/"),
             asr_timeout_s=float(os.environ.get("ECHOBRIDGE_ASR_TIMEOUT_S", "8")),
