@@ -139,3 +139,14 @@ def test_short_segment_carry_expires():
     events = push_windows(vad, list(range(1, len(probs) + 1)))
     finals = [e for e in events if e.kind == "final"]
     assert 1 not in tags_of(finals[1].pcm)
+
+
+def test_soft_voice_opened_idle_counts_as_speech():
+    # Every window 0.4: opens at the idle start threshold and must keep
+    # counting as speech instead of endpointing as silence at 0.5.
+    probs = [0.0] * 3 + [0.4] * 20 + [0.0] * 12
+    vad = SileroVAD(silero_settings(), model=ScriptedModel(probs))
+    events = push_windows(vad, list(range(1, len(probs) + 1)))
+    finals = [e for e in events if e.kind == "final"]
+    assert len(finals) == 1
+    assert finals[0].speech_ms >= 18 * 32

@@ -167,6 +167,10 @@ class SileroVAD:
         self._silence_ms = 0
         self._start_windows = 0
         self._start_gaps = 0
+        # Threshold that opened the current segment; speech/silence inside the
+        # segment is judged against the same value (hysteresis), otherwise a
+        # soft voice opens at 0.35 and is then counted as silence at 0.5.
+        self._speech_threshold = self._threshold
         self._item_seq = 0
         self._item_id = ""
         self._early_sent = False
@@ -274,6 +278,7 @@ class SileroVAD:
                         self._active = True
                         self._item_seq += 1
                         self._item_id = f"item_{self._item_seq}"
+                        self._speech_threshold = start_threshold
                         self._segment = bytearray(self._carry + self._pre_roll_pcm())
                         self._speech_ms = self._carry_speech_ms
                         self._silence_ms = 0
@@ -298,7 +303,7 @@ class SileroVAD:
             if not started_now:
                 self._segment.extend(window)
 
-            if probability >= self._threshold:
+            if probability >= self._speech_threshold:
                 if self._early_sent:
                     self._early_sent = False
                     events.append(VADEvent("resume", self._item_id, speech_ms=self._speech_ms))

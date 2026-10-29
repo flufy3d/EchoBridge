@@ -462,6 +462,12 @@ class Session:
             app_canceled = not old_response_active and barge_ctx is not None
             self._barge_in_ctx = None
             if not event.pcm or event.speech_ms < self._settings.vad_min_speech_ms:
+                logger.info(
+                    "vad segment too short item=%s speech_ms=%d bytes=%d",
+                    event.item_id,
+                    event.speech_ms,
+                    len(event.pcm),
+                )
                 self._discard_speculative_asr()
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
