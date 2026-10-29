@@ -36,13 +36,68 @@ class DeepSeekLLM:
         if not settings.llm_api_key:
             raise ValueError("ECHOBRIDGE_LLM_API_KEY is required for llm_backend=deepseek")
         self._settings = settings
+        # httpx's default keep-alive expiry is 5 s.  Conversation gaps are
+        # usually longer, which forced a new TLS handshake (about 270 ms on
+        # this link) before nearly every turn.
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(
                 settings.llm_total_timeout_s,
                 connect=5.0,
                 read=settings.llm_total_timeout_s,
-            )
+            ),
+            limits=httpx.Limits(
+                max_connections=4,
+                max_keepalive_connections=4,
+                keepalive_expiry=max(5.0, settings.llm_keepalive_s),
+            ),
         )
+        self._warm_lock = asyncio.Lock()
+        self._last_warm = 0.0
+
+    def _models_url(self) -> str:
+        url = self._settings.llm_url
+        for suffix in ("/chat/completions", "/completions"):
+            if url.endswith(suffix):
+                return url[: -len(suffix)] + "/models"
+        return url.rstrip("/") + "/models"
+
+    async def warm(self) -> None:
+        """Open the TLS/HTTP connection while the user is still speaking.
+
+        A cheap GET is enough: the handshake and connection-pool entry are the
+        expensive part.  /models is supported by OpenAI-compatible gateways;
+        even a 401/404 leaves a warm keep-alive connection behind.
+        """
+        if not self._settings.llm_prewarm:
+            return
+        now = time.monotonic()
+        if now - self._last_warm < 5.0:
+            return
+        async with self._warm_lock:
+            now = time.monotonic()
+            if now - self._last_warm < 5.0:
+                return
+            self._last_warm = now
+            started = time.perf_counter()
+            try:
+                response = await self._client.get(
+                    self._models_url(),
+                    headers={
+                        "Authorization": f"Bearer {self._settings.llm_api_key}",
+                        # Cloudflare on opencode.ai rejects some library UAs.
+                        "User-Agent": "curl/8.0",
+                    },
+                    timeout=3.0,
+                )
+                await response.aread()
+                logger.debug(
+                    "llm warm %d in %.0f ms",
+                    response.status_code,
+                    (time.perf_counter() - started) * 1000.0,
+                )
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                logger.debug("llm warm failed in %.0f ms: %s", elapsed_ms, exc)
 
     async def stream(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -53,8 +108,14 @@ class DeepSeekLLM:
             "stream": True,
             "max_tokens": self._settings.llm_max_tokens,
             "temperature": self._settings.llm_temperature,
-            "reasoning_effort": "low",
         }
+        if self._settings.llm_thinking == "enabled":
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = "low"
+        else:
+            # reasoning_effort=low only reduces depth; thinking stays on and
+            # still adds 200-400 ms before the first spoken character.
+            payload["thinking"] = {"type": "disabled"}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -68,6 +129,7 @@ class DeepSeekLLM:
 
         started = time.perf_counter()
         for attempt in range(3):
+            attempt_started = time.perf_counter()
             try:
                 async with self._client.stream(
                     "POST", self._settings.llm_url, json=payload, headers=headers
@@ -89,7 +151,7 @@ class DeepSeekLLM:
                         raise RuntimeError(
                             f"DeepSeek HTTP {response.status_code}: {body[:200]}"
                         )
-                    async for delta in self._parse_sse(response):
+                    async for delta in self._parse_sse(response, attempt_started):
                         yield delta
                     logger.info("llm stream done in %.0f ms", (time.perf_counter() - started) * 1000)
                     return
@@ -100,9 +162,13 @@ class DeepSeekLLM:
                 raise
         raise RuntimeError("DeepSeek request failed after retries")
 
-    async def _parse_sse(self, response: httpx.Response) -> AsyncIterator[LLMDelta]:
+    async def _parse_sse(
+        self, response: httpx.Response, request_started: float | None = None
+    ) -> AsyncIterator[LLMDelta]:
         lines = response.aiter_lines().__aiter__()
         started = time.monotonic()
+        if request_started is None:
+            request_started = time.perf_counter()
         first_content = False
         first_tool = False
         accumulated: dict[int, dict[str, str]] = {}
@@ -151,8 +217,11 @@ class DeepSeekLLM:
             if isinstance(content, str) and content:
                 if not first_content:
                     first_content = True
+                    # Measure from the request write, not from the SSE parser:
+                    # the old number excluded connect + provider first token.
                     logger.info(
-                        "llm first content %.0f ms", (time.monotonic() - started) * 1000
+                        "llm first content %.0f ms",
+                        (time.perf_counter() - request_started) * 1000,
                     )
                 yield LLMDelta(text=content)
             for tool_delta in delta.get("tool_calls") or []:

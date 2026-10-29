@@ -29,6 +29,7 @@ from .llm import MockLLM
 from .llm_deepseek import DeepSeekLLM, build_system_prompt
 from .logging import get_logger
 from .pacer import AudioPacer
+from .speculative import SpeculativeLLM
 from .text import clean_for_tts, is_stop_command, pop_tts_chunk, split_for_tts
 from .tools import available_tool_names, convert_tools
 from .tts import TTSBackend
@@ -70,6 +71,7 @@ class Session:
         vad: VADBackend | None = None,
         tts: TTSBackend | None = None,
         voice_registry: VoiceRegistry | None = None,
+        llm: Any | None = None,
     ) -> None:
         self._ws = ws
         self._settings = settings
@@ -119,6 +121,10 @@ class Session:
         self._spec_task: asyncio.Task | None = None
         self._spec_item = ""
         self._spec_pcm_bytes = 0
+        self._spec_llm: SpeculativeLLM | None = None
+        self._spec_llm_text = ""
+        self._turn_spec_llm: SpeculativeLLM | None = None
+        self._llm_warm_task: asyncio.Task | None = None
         self._backchannel_task: asyncio.Task[None] | None = None
         self._last_backchannel = ""
         self._backchannel_sent_this_turn = False
@@ -126,7 +132,12 @@ class Session:
         self._first_audio_generation = 0
         self._backchannel_sent_generation = 0
         self._llm = MockLLM(settings.llm_char_delay_ms)
-        self._deepseek = DeepSeekLLM(settings) if settings.llm_backend == "deepseek" else None
+        if llm is not None:
+            self._deepseek = llm
+        else:
+            self._deepseek = (
+                DeepSeekLLM(settings) if settings.llm_backend == "deepseek" else None
+            )
         from .tts import make_tts
 
         self._tts = tts or make_tts(settings, self._voice_registry)
@@ -186,6 +197,7 @@ class Session:
         self._closing = True
         self._discard_speculative_asr()
         self._cancel_voice_warm()
+        self._cancel_llm_warm()
         await self._cancel_active(send_canceled=False, reason=f"close:{reason}")
         self._vad.reset()
         if not self._closed:
@@ -312,6 +324,7 @@ class Session:
             )
         )
         self._schedule_voice_warm()
+        self._schedule_llm_warm()
         logger.info(
             "session created id=%s device=%s model=%s voice=%s voice_name=%s "
             "fallback=%s tools=%d filtered=%d full_duplex=%s aec=%s",
@@ -450,6 +463,9 @@ class Session:
 
     async def _handle_vad_event(self, event: VADEvent) -> None:
         if event.kind == "started":
+            # The user is talking for at least a few hundred ms; use that time
+            # to complete the LLM TLS handshake instead of paying it after ASR.
+            self._schedule_llm_warm()
             # While a response is playing, keep accumulating audio but do not
             # tell the app: asr.started makes it flush local TTS.  A short
             # cough must not interrupt the answer; the app's RMS barge-in or
@@ -483,9 +499,21 @@ class Session:
                 self._discard_speculative_asr()
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
+            # Stop the old answer before transcribing the barge-in.  With two
+            # vLLM processes sharing one GPU, TTS decode and ASR decode are
+            # time-sliced: measured 4 s ASR 102 ms idle vs 768 ms while TTS
+            # was generating.  Playback is already superseded by the user.
+            barge_canceled = False
+            reset_vad = not self._full_duplex
+            if old_response_active:
+                await self._cancel_active(
+                    send_canceled=True, reason="barge_in", reset_vad=reset_vad
+                )
+                barge_canceled = True
             asr_started = time.perf_counter()
             result = await self._take_speculative_asr(event)
             speculative = result is not None
+            spec_llm: SpeculativeLLM | None = None
             if result is None:
                 try:
                     result = await self._transcribe_pcm(event.pcm)
@@ -499,6 +527,7 @@ class Session:
             text = (result.text or "").strip()
             self._dump_segment(event, text)
             if not text:
+                self._discard_speculative_llm()
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
             hotwords = (
@@ -512,8 +541,17 @@ class Session:
                     event.item_id,
                     len(text),
                 )
+                self._discard_speculative_llm()
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
+            # Reuse the LLM request that was started from the speculative ASR
+            # result.  The text is identical because the final path above
+            # reused that same result; otherwise the stale request is dropped.
+            spec_llm = (
+                self._take_speculative_llm(text)
+                if speculative
+                else self._discard_speculative_llm()
+            )
             logger.info(
                 "asr final item=%s chars=%d speech_ms=%d worker_ms=%.1f wall_ms=%.1f spec=%s",
                 event.item_id,
@@ -529,14 +567,12 @@ class Session:
             if is_stop_command(text):
                 # A barge-in "停一下/不用了" must stop the old answer without
                 # turning the stop phrase into a brand-new LLM turn.
+                if spec_llm is not None:
+                    spec_llm.cancel()
                 logger.info(
                     "stop command item=%s chars=%d", event.item_id, len(text)
                 )
-                if self._response_active:
-                    reset_vad = not self._full_duplex
-                    await self._cancel_active(
-                        send_canceled=True, reason="barge_in", reset_vad=reset_vad
-                    )
+                if barge_canceled:
                     self._log_barge_in(
                         barge_ctx,
                         speech_ms=event.speech_ms,
@@ -558,13 +594,7 @@ class Session:
                 await self._send(protocol.response_done(ctx, "stopped"), ctx=ctx)
                 self._finish_response(ctx)
                 return
-            if self._response_active:
-                # Full duplex: the user may still be talking while ASR ran;
-                # a reset here would drop that audio (seen as reset_vad=1).
-                reset_vad = not self._full_duplex
-                await self._cancel_active(
-                    send_canceled=True, reason="barge_in", reset_vad=reset_vad
-                )
+            if barge_canceled:
                 self._log_barge_in(
                     barge_ctx,
                     speech_ms=event.speech_ms,
@@ -580,7 +610,7 @@ class Session:
                     reset_vad=False,
                     app_canceled=True,
                 )
-            await self._start_turn(text)
+            await self._start_turn(text, spec_llm=spec_llm)
 
     def _dump_segment(self, event: VADEvent, text: str) -> None:
         """Debug only (ECHOBRIDGE_VAD_DUMP_DIR): keep the exact ASR input."""
@@ -651,6 +681,81 @@ class Session:
         task = asyncio.create_task(run(), name=f"spec-asr-{event.item_id}")
         self._spec_task = task
         task.add_done_callback(self._consume_task_exception)
+        task.add_done_callback(
+            lambda done, item_id=event.item_id: self._on_speculative_asr_done(
+                done, item_id
+            )
+        )
+
+    def _on_speculative_asr_done(
+        self, task: asyncio.Task, item_id: str
+    ) -> None:
+        """Start the LLM while the endpoint timer is still running."""
+        if task is not self._spec_task or task.cancelled():
+            return
+        if self._closed or self._response_active or self._spec_llm is not None:
+            return
+        try:
+            result = task.result()
+        except Exception:
+            return
+        text = (result.text or "").strip() if result is not None else ""
+        if not text:
+            return
+        hotwords = (
+            self._settings.asr_hotwords
+            if self._session_hotwords is None
+            else self._session_hotwords
+        )
+        if is_hotword_echo(text, hotwords) or is_stop_command(text):
+            return
+        self._start_speculative_llm(text, item_id)
+
+    def _start_speculative_llm(self, text: str, item_id: str) -> None:
+        if self._deepseek is None or not self._settings.llm_speculative:
+            return
+        self._discard_speculative_llm()
+        messages = [
+            *self._build_llm_messages(),
+            {"role": "user", "content": text},
+        ]
+        spec = SpeculativeLLM(
+            lambda: self._deepseek.stream(messages, self._tools_openai),
+            name=item_id,
+        )
+        spec.start()
+        self._spec_llm = spec
+        self._spec_llm_text = text
+        logger.info(
+            "speculative llm started item=%s chars=%d", item_id, len(text)
+        )
+
+    def _take_speculative_llm(self, text: str) -> SpeculativeLLM | None:
+        spec = self._spec_llm
+        expected = self._spec_llm_text
+        self._spec_llm = None
+        self._spec_llm_text = ""
+        if spec is None:
+            return None
+        if text != expected:
+            spec.cancel()
+            return None
+        if spec.error is not None and spec.produced == 0:
+            spec.cancel()
+            return None
+        logger.info(
+            "speculative llm reused chars=%d produced=%d",
+            len(text),
+            spec.produced,
+        )
+        return spec
+
+    def _discard_speculative_llm(self) -> None:
+        spec = self._spec_llm
+        self._spec_llm = None
+        self._spec_llm_text = ""
+        if spec is not None:
+            spec.cancel()
 
     def _discard_speculative_asr(self) -> None:
         task = self._spec_task
@@ -659,6 +764,7 @@ class Session:
         self._spec_pcm_bytes = 0
         if task is not None and not task.done():
             task.cancel()
+        self._discard_speculative_llm()
 
     async def _take_speculative_asr(self, event: VADEvent):
         task = self._spec_task
@@ -717,6 +823,23 @@ class Session:
         if task is not None and not task.done():
             task.cancel()
 
+    def _schedule_llm_warm(self) -> None:
+        if self._deepseek is None or not self._settings.llm_prewarm:
+            return
+        task = self._llm_warm_task
+        if task is not None and not task.done():
+            return
+        self._llm_warm_task = asyncio.create_task(
+            self._deepseek.warm(), name="llm-warm"
+        )
+        self._llm_warm_task.add_done_callback(self._consume_task_exception)
+
+    def _cancel_llm_warm(self) -> None:
+        task = self._llm_warm_task
+        self._llm_warm_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _handle_tool_results(self, event: dict[str, Any]) -> None:
         for result in protocol.extract_tool_results(event):
             future = self._pending_tools.get(result.call_id)
@@ -727,7 +850,9 @@ class Session:
     # Response lifecycle
     # ------------------------------------------------------------------
 
-    async def _start_turn(self, transcript: str) -> None:
+    async def _start_turn(
+        self, transcript: str, *, spec_llm: SpeculativeLLM | None = None
+    ) -> None:
         if self._response_active:
             await self._cancel_active(send_canceled=True, reason="new_turn")
         self._turn_started_at = time.perf_counter()
@@ -737,6 +862,12 @@ class Session:
         self._trim_history()
         self._schedule_backchannel(ctx)
         runner = self._run_deepseek_turn if self._deepseek is not None else self._run_turn
+        if spec_llm is not None and self._deepseek is not None:
+            self._turn_spec_llm = spec_llm
+        else:
+            if spec_llm is not None:
+                spec_llm.cancel()
+            self._turn_spec_llm = None
         self._response_task = asyncio.create_task(
             runner(ctx, transcript), name=f"turn-{ctx.response_id}"
         )
@@ -977,21 +1108,54 @@ class Session:
             return full
         finally:
             pacer.cancel()
+            # Close the upstream generator explicitly: a speculative LLM
+            # producer must not keep streaming after this turn stops reading.
+            aclose = getattr(source, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    pass
 
     async def _run_deepseek_turn(
         self, ctx: protocol.ResponseContext, transcript: str
     ) -> None:
+        spec = self._turn_spec_llm
+        self._turn_spec_llm = None
         try:
             if self._deepseek is None:
                 raise RuntimeError("DeepSeek backend not initialized")
-            for _hop in range(3):
+            for hop in range(3):
+                use_spec = hop == 0 and spec is not None
                 tool_calls: list[protocol.ToolCall] = []
                 text_parts: list[str] = []
 
-                async def text_source():
+                async def delta_source():
+                    if use_spec and spec is not None:
+                        async for delta in spec.deltas():
+                            yield delta
+                        if (
+                            spec.error is not None
+                            and not text_parts
+                            and not tool_calls
+                        ):
+                            # The pre-started request failed before producing
+                            # anything; fall back to a normal request.
+                            logger.warning(
+                                "speculative llm produced nothing, retrying"
+                            )
+                            async for delta in self._deepseek.stream(
+                                self._build_llm_messages(), self._tools_openai
+                            ):
+                                yield delta
+                        return
                     async for delta in self._deepseek.stream(
                         self._build_llm_messages(), self._tools_openai
                     ):
+                        yield delta
+
+                async def text_source():
+                    async for delta in delta_source():
                         if delta.text:
                             text_parts.append(delta.text)
                             yield delta.text
@@ -1052,6 +1216,8 @@ class Session:
             if not self._closed and ctx.generation == self._generation:
                 await self._send(protocol.response_done(ctx, "failed"), ctx=ctx)
         finally:
+            if spec is not None:
+                spec.cancel()
             self._finish_response(ctx)
 
     def _build_llm_messages(self) -> list[dict[str, Any]]:
@@ -1101,6 +1267,10 @@ class Session:
             # response.canceled again or disturb a preserved VAD segment.
             return None
         self._cancel_backchannel()
+        spec = self._turn_spec_llm
+        self._turn_spec_llm = None
+        if spec is not None:
+            spec.cancel()
         self._turn_started_at = None
         if reset_vad:
             # A preserved segment may still reuse its in-flight speculative
@@ -1142,6 +1312,10 @@ class Session:
 
     def _finish_response(self, ctx: protocol.ResponseContext) -> None:
         self._cancel_backchannel()
+        spec = self._turn_spec_llm
+        self._turn_spec_llm = None
+        if spec is not None:
+            spec.cancel()
         self._turn_started_at = None
         if self._active_ctx is not ctx:
             return
@@ -1195,6 +1369,7 @@ class Session:
     async def _shutdown(self) -> None:
         self._discard_speculative_asr()
         self._cancel_voice_warm()
+        self._cancel_llm_warm()
         self._vad.reset()
         if not self._closed:
             await self._cancel_active(send_canceled=False, reason="shutdown")

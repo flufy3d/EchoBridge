@@ -64,6 +64,9 @@ async def _worker_health(
         )
     elif settings.asr_backend == "qwen3":
         probes["asr"] = (settings.asr_url + "/healthz", "ok")
+    elif settings.asr_backend == "vllm":
+        # vLLM answers 200 with an empty body; the status code is the signal.
+        probes["asr"] = (settings.asr_url + "/health", "status")
 
     if settings.tts_backend == "inprocess":
         health = getattr(tts, "health", None)
@@ -173,7 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     shared_vad = make_vad(settings)
     shared_asr = (
         make_asr(settings)
-        if settings.asr_backend in {"qwen3", "inprocess"}
+        if settings.asr_backend in {"qwen3", "inprocess", "vllm"}
         else None
     )
     # Keep one TTS client for the whole gateway: its cache holds the fixed

@@ -41,10 +41,12 @@ fi
 "${SYSTEMCTL[@]}" disable --now echobridge-watchdog.timer 2>/dev/null || true
 "${SYSTEMCTL[@]}" disable --now echobridge-gateway.service 2>/dev/null || true
 "${SYSTEMCTL[@]}" disable --now echobridge-asr.service 2>/dev/null || true
+"${SYSTEMCTL[@]}" disable --now echobridge-asr-vllm.service 2>/dev/null || true
 "${SYSTEMCTL[@]}" disable --now echobridge-tts.service 2>/dev/null || true
 rm -f \
   "$UNIT_DIR/echobridge-gateway.service" \
   "$UNIT_DIR/echobridge-asr.service" \
+  "$UNIT_DIR/echobridge-asr-vllm.service" \
   "$UNIT_DIR/echobridge-tts.service" \
   "$UNIT_DIR/echobridge-watchdog.service" \
   "$UNIT_DIR/echobridge-watchdog.timer"

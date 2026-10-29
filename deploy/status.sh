@@ -31,8 +31,8 @@ fi
 
 echo "== units =="
 "${SYSTEMCTL[@]}" --no-pager --lines=0 status \
-  echobridge-gateway.service echobridge-asr.service echobridge-tts.service \
-  echobridge-watchdog.timer 2>&1 | sed -n '1,80p'
+  echobridge-gateway.service echobridge-asr.service echobridge-asr-vllm.service \
+  echobridge-tts.service echobridge-watchdog.timer 2>&1 | sed -n '1,100p'
 
 echo
 echo "== health =="

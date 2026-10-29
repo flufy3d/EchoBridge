@@ -155,10 +155,14 @@ TTS_BACKEND="$(grep -E '^ECHOBRIDGE_TTS_BACKEND=' "$ENV_FILE" | tail -1 | cut -d
 TTS_BACKEND="${TTS_BACKEND:-vllm}"
 WORKER_UNITS=""
 ASR_UNIT_ENABLE=0
+ASR_VLLM_UNIT_ENABLE=0
 TTS_UNIT_ENABLE=0
 if [[ "$ASR_BACKEND" == "qwen3" ]]; then
   WORKER_UNITS="$WORKER_UNITS echobridge-asr.service"
   ASR_UNIT_ENABLE=1
+elif [[ "$ASR_BACKEND" == "vllm" ]]; then
+  WORKER_UNITS="$WORKER_UNITS echobridge-asr-vllm.service"
+  ASR_VLLM_UNIT_ENABLE=1
 fi
 if [[ "$TTS_BACKEND" == "vllm" || "$TTS_BACKEND" == "qwen3" ]]; then
   WORKER_UNITS="$WORKER_UNITS echobridge-tts.service"
@@ -168,6 +172,7 @@ WORKER_UNITS="${WORKER_UNITS# }"
 
 render "$ROOT/deploy/systemd/echobridge-gateway.service.in" "$UNIT_DIR/echobridge-gateway.service"
 render "$ROOT/deploy/systemd/echobridge-asr.service.in" "$UNIT_DIR/echobridge-asr.service"
+render "$ROOT/deploy/systemd/echobridge-asr-vllm.service.in" "$UNIT_DIR/echobridge-asr-vllm.service"
 render "$ROOT/deploy/systemd/echobridge-tts.service.in" "$UNIT_DIR/echobridge-tts.service"
 render "$ROOT/deploy/systemd/echobridge-watchdog.service.in" "$UNIT_DIR/echobridge-watchdog.service"
 install -m 644 "$ROOT/deploy/systemd/echobridge-watchdog.timer" "$UNIT_DIR/echobridge-watchdog.timer"
@@ -208,9 +213,19 @@ if ((ASR_UNIT_ENABLE)); then
 else
   "${SYSTEMCTL[@]}" disable --now echobridge-asr.service >/dev/null 2>&1 || true
 fi
+if ((ASR_VLLM_UNIT_ENABLE)); then
+  ENABLE_UNITS=(echobridge-asr-vllm.service "${ENABLE_UNITS[@]}")
+  START_UNITS+=(echobridge-asr-vllm.service)
+else
+  "${SYSTEMCTL[@]}" disable --now echobridge-asr-vllm.service >/dev/null 2>&1 || true
+fi
 if ((TTS_UNIT_ENABLE)); then
   ENABLE_UNITS=(echobridge-tts.service "${ENABLE_UNITS[@]}")
-  START_UNITS+=(echobridge-tts.service)
+  # systemctl queues one job per unit in argument order, and the vLLM ASR
+  # unit's After=echobridge-tts.service only delays it when the TTS job is
+  # already queued.  Keep TTS first so the ASR model never loads while the
+  # TTS worker is still profiling memory.
+  START_UNITS=(echobridge-tts.service "${START_UNITS[@]}")
 else
   "${SYSTEMCTL[@]}" disable --now echobridge-tts.service >/dev/null 2>&1 || true
 fi

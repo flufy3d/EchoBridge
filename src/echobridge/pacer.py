@@ -14,7 +14,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 from . import protocol
-from .audio import OUTPUT_FRAME_BYTES, iter_frames, pcm16_b64
+from .audio import OUTPUT_FRAME_BYTES, pcm16_b64
 from .logging import get_logger
 
 logger = get_logger("echobridge.pacer")
@@ -66,33 +66,53 @@ class AudioPacer:
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time()
+        pending = b""
+
+        async def emit(frame: bytes) -> bool:
+            nonlocal deadline
+            if not self.started:
+                ok = await self._send_event(protocol.audio_started(self._ctx), self._ctx)
+                if not ok:
+                    return False
+                self.started = True
+            ok = await self._send_event(
+                protocol.audio_delta(self._ctx, pcm16_b64(frame)), self._ctx
+            )
+            if not ok:
+                return False
+            deadline += self._interval
+            now = loop.time()
+            if deadline > now:
+                await asyncio.sleep(deadline - now)
+            else:
+                # We fell behind (GC, slow client, scheduler).  Do not
+                # accumulate debt; restart the clock from now.
+                deadline = now
+            return True
+
         try:
             while True:
                 chunk = await self._queue.get()
                 if chunk is None:
                     break
-                for frame in iter_frames(chunk, OUTPUT_FRAME_BYTES, pad=True):
-                    if not self.started:
-                        ok = await self._send_event(
-                            protocol.audio_started(self._ctx), self._ctx
-                        )
-                        if not ok:
-                            return
-                        self.started = True
-                    ok = await self._send_event(
-                        protocol.audio_delta(self._ctx, pcm16_b64(frame)),
-                        self._ctx,
-                    )
-                    if not ok:
+                # TTS/dispatcher reads are not frame-aligned (64 KiB/30 KiB is
+                # typical).  Carry the tail into the next read instead of
+                # padding every read to 20 ms: the old path inserted 15-20 ms
+                # of silence every ~2 s and was audible as a click.
+                pending += chunk
+                usable = len(pending) - (len(pending) % OUTPUT_FRAME_BYTES)
+                if not usable:
+                    continue
+                block = pending[:usable]
+                pending = pending[usable:]
+                for offset in range(0, usable, OUTPUT_FRAME_BYTES):
+                    if not await emit(block[offset : offset + OUTPUT_FRAME_BYTES]):
                         return
-                    deadline += self._interval
-                    now = loop.time()
-                    if deadline > now:
-                        await asyncio.sleep(deadline - now)
-                    else:
-                        # We fell behind (GC, slow client, scheduler).  Do not
-                        # accumulate debt; restart the clock from now.
-                        deadline = now
+            if pending:
+                # End of response: the only place padding is allowed.
+                padded = pending + b"\x00" * (OUTPUT_FRAME_BYTES - len(pending))
+                if not await emit(padded):
+                    return
             if self.started:
                 await self._send_event(protocol.audio_done(self._ctx), self._ctx)
             self.done = True

@@ -35,6 +35,8 @@ wait_for() {
 
 if [[ "$ASR_BACKEND" == "qwen3" ]]; then
   wait_for asr "${ASR_URL%/}/healthz"
+elif [[ "$ASR_BACKEND" == "vllm" ]]; then
+  wait_for asr "${ASR_URL%/}/health"
 fi
 if [[ "$TTS_BACKEND" == "vllm" ]]; then
   wait_for tts "${TTS_URL%/}/health"

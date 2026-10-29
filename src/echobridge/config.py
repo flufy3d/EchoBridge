@@ -35,6 +35,33 @@ def _env_phrases(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return phrases or default
 
 
+def _env_ints(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Read a comma-separated integer list (``1,2,4,8``)."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    values: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a comma-separated integer list") from exc
+    return tuple(values) or default
+
+
+def _env_choice(name: str, default: str, choices: set[str]) -> str:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {sorted(choices)}")
+    return value
+
+
 def build_asr_context(hotwords: tuple[str, ...] | list[str]) -> str:
     """Build the free-form Qwen3-ASR context string from hotword terms."""
     terms = tuple(str(term).strip() for term in hotwords if str(term).strip())
@@ -106,6 +133,8 @@ class Settings:
     # lives in the gateway process and shares its CUDA context with an
     # in-process TTS backend, if one is enabled.
     asr_model: str = "~/.cache/echobridge/models/Qwen3-ASR-0.6B"
+    # Served model name when ``asr_backend=vllm`` (vLLM -m / --served-model-name).
+    asr_vllm_model: str = "qwen3-asr"
     asr_language: str = "Chinese"
     asr_max_new_tokens: int = 192
     asr_device: str = "cuda:0"
@@ -132,8 +161,14 @@ class Settings:
     tts_attn_implementation: str = "sdpa"
     tts_compile: bool = False
     # Streaming codec chunking, mirroring deploy/qwen3_tts_echobridge.yaml.
+    # A flat 1 -> 25 frame step leaves 0.4-0.7 s of silence after the first
+    # 80 ms packet, because the next packet waits for two seconds of audio.
+    # Ramp the packet duration instead: 160, 320, 640, 960, 2000 ms.  The
+    # first packet is 160 ms rather than 80 ms so playback does not run dry
+    # before the second packet arrives.
     tts_initial_codec_frames: int = 1
     tts_codec_chunk_frames: int = 25
+    tts_codec_chunk_ramp: tuple[int, ...] = (2, 4, 8, 12, 25)
     tts_codec_left_context_frames: int = 72
     tts_voice_id: str = "mingyue_v1"
     # Voice registry.  ``tts_voice_registry`` is optional; when empty the
@@ -153,6 +188,18 @@ class Settings:
     llm_temperature: float = 0.6
     llm_first_token_timeout_s: float = 8.0
     llm_total_timeout_s: float = 30.0
+    # DeepSeek thinking is on by default and costs 200-400 ms before the first
+    # spoken character.  Real-time voice replies do not need it; set to
+    # "enabled" only for debugging a reasoning-heavy answer.
+    llm_thinking: str = "disabled"
+    # httpx closes idle keep-alive connections after 5 s by default, so almost
+    # every turn paid a fresh TLS handshake.  Keep the pool warm between turns.
+    llm_keepalive_s: float = 300.0
+    # Open the TLS/HTTP connection when VAD hears the user start talking.
+    llm_prewarm: bool = True
+    # Start the LLM request as soon as the speculative ASR result is ready,
+    # before endpoint confirmation.  Playback still waits for the endpoint.
+    llm_speculative: bool = True
 
     # Mock LLM/TTS pacing.
     llm_char_delay_ms: int = 12
@@ -248,6 +295,10 @@ class Settings:
                 "ECHOBRIDGE_ASR_MODEL",
                 "~/.cache/echobridge/models/Qwen3-ASR-0.6B",
             ),
+            asr_vllm_model=os.environ.get(
+                "ECHOBRIDGE_ASR_VLLM_MODEL", "qwen3-asr"
+            ).strip()
+            or "qwen3-asr",
             asr_language=os.environ.get("ECHOBRIDGE_ASR_LANGUAGE", "Chinese").strip(),
             asr_max_new_tokens=_env_int("ECHOBRIDGE_ASR_MAX_NEW_TOKENS", 192),
             asr_device=os.environ.get("ECHOBRIDGE_ASR_DEVICE", "cuda:0").strip()
@@ -278,6 +329,9 @@ class Settings:
             tts_compile=_env_bool("ECHOBRIDGE_TTS_COMPILE", False),
             tts_initial_codec_frames=_env_int("ECHOBRIDGE_TTS_INITIAL_CODEC_FRAMES", 1),
             tts_codec_chunk_frames=_env_int("ECHOBRIDGE_TTS_CODEC_CHUNK_FRAMES", 25),
+            tts_codec_chunk_ramp=_env_ints(
+                "ECHOBRIDGE_TTS_CODEC_CHUNK_RAMP", (2, 4, 8, 12, 25)
+            ),
             tts_codec_left_context_frames=_env_int(
                 "ECHOBRIDGE_TTS_CODEC_LEFT_CONTEXT_FRAMES", 72
             ),
@@ -313,6 +367,12 @@ class Settings:
                 os.environ.get("ECHOBRIDGE_LLM_FIRST_TOKEN_TIMEOUT_S", "8")
             ),
             llm_total_timeout_s=float(os.environ.get("ECHOBRIDGE_LLM_TOTAL_TIMEOUT_S", "30")),
+            llm_thinking=_env_choice(
+                "ECHOBRIDGE_LLM_THINKING", "disabled", {"disabled", "enabled"}
+            ),
+            llm_keepalive_s=float(os.environ.get("ECHOBRIDGE_LLM_KEEPALIVE_S", "300")),
+            llm_prewarm=_env_bool("ECHOBRIDGE_LLM_PREWARM", True),
+            llm_speculative=_env_bool("ECHOBRIDGE_LLM_SPECULATIVE", True),
             llm_char_delay_ms=_env_int("ECHOBRIDGE_LLM_CHAR_DELAY_MS", 12),
             tts_first_chunk_ms=_env_int("ECHOBRIDGE_TTS_FIRST_CHUNK_MS", 60),
             tts_tone_char_ms=_env_int("ECHOBRIDGE_TTS_TONE_CHAR_MS", 55),

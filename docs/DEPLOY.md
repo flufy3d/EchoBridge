@@ -10,17 +10,23 @@ X10A ── wss://work-pc.<tailnet>.ts.net:8443 ── Tailscale Serve（仅 tai
                                                      │ http://127.0.0.1:18787
                                                      ▼
                                             echobridge-gateway
-                                              ├── Qwen3-ASR（进程内，同一 CUDA context）
+                                              ├── Qwen3-ASR（in-process 或 :18801 vLLM）
                                               └── 127.0.0.1:18802  TTS worker (vLLM-Omni)
 ```
 
-默认 `ECHOBRIDGE_ASR_BACKEND=inprocess`：ASR 模型直接加载在 gateway 进程内，
-不再需要 18801/`echobridge-asr`。切换回 `qwen3` 时才使用独立的 ASR worker。
+`ECHOBRIDGE_ASR_BACKEND` 有三种选择：
+
+- `inprocess`（默认/回退）：ASR 模型直接加载在 gateway 进程内。
+- `vllm`：独立的 vLLM-ASR 服务，监听 18801，固定 256 MiB KV；after-endpoint
+  从约 900 ms 降到约 114 ms，代价是约 2.3 GiB 显存，以及和 TTS 同时解码时
+  ASR 会慢约 7 倍。部署为 `echobridge-asr-vllm.service`。
+- `qwen3`：旧的 18801 HF worker（`scripts/asr_worker.sh`）。
 
 | 服务 | 端口 | 启动方式 | 说明 |
 |---|---|---|---|
-| `echobridge-gateway` | 18787 | `python -m echobridge` | WSS、VAD、turn、LLM、pacer、进程内 ASR |
-| `echobridge-asr`（可选回退） | 18801 | `scripts/asr_worker.sh` | Qwen3-ASR-0.6B，独立 venv |
+| `echobridge-gateway` | 18787 | `python -m echobridge` | WSS、VAD、turn、LLM、pacer |
+| `echobridge-asr-vllm`（可选） | 18801 | `scripts/asr_vllm.sh` | Qwen3-ASR-0.6B，vLLM 0.32 + CUDA Graph |
+| `echobridge-asr`（旧回退） | 18801 | `scripts/asr_worker.sh` | Qwen3-ASR-0.6B，独立 venv |
 | `echobridge-tts` | 18802 | `scripts/tts_vllm.sh` | Qwen3-TTS-0.6B，vLLM-Omni |
 | `echobridge-watchdog.timer` | — | `deploy/watchdog.sh` | 每 30 s 检查进程与 worker |
 
@@ -63,9 +69,11 @@ bash deploy/install.sh --user --stop-legacy
 - 配置安装到 `~/.config/echobridge/echobridge.env`（600）。
 - 首次安装会复用 `var/dev-token`，**不会更换 X10A 已保存的 token**；并从 `var/llm.env` 导入 LLM key（不打印）。
 - `--stop-legacy` 只停止当前监听 18787/18801/18802 的手工进程；如果 systemd 网关已运行则跳过。
-- `ECHOBRIDGE_ASR_BACKEND=inprocess` 时不会启动 `echobridge-asr`；网关直接加载
-  ASR 模型。`ECHOBRIDGE_TTS_BACKEND=inprocess` 时同样不会启动 `echobridge-tts`。
-  切回 `qwen3`/`vllm` 后重新运行 `deploy/install.sh` 才会启用对应 worker。
+- `ECHOBRIDGE_ASR_BACKEND=inprocess` 时不会启动任何 ASR worker；网关直接加载
+  ASR 模型。`vllm` 会启用 `echobridge-asr-vllm`，`qwen3` 会启用旧
+  `echobridge-asr`。`ECHOBRIDGE_TTS_BACKEND=inprocess` 时不会启动
+  `echobridge-tts`。切换后端后重新运行 `deploy/install.sh` 才会启用/停用对应
+  worker；**不要同时启用两个 ASR worker**。
 - 安装后按 env 启动 worker（如 vLLM），再起网关；网关 `ExecStartPre` 最多等
   300 s 让 TTS 就绪。
 
@@ -190,7 +198,8 @@ Watchdog 每 30 s 检查：
 
 - 网关 `/healthz`（连续 3 次失败 → 重启网关）；进程内 ASR 的就绪状态在
   `/readyz` 的 `workers.asr` 中直接可见；
-- 仅当 `ECHOBRIDGE_ASR_BACKEND=qwen3` 时检查 ASR `/healthz`；
+- 当 `ECHOBRIDGE_ASR_BACKEND=vllm` 时检查 `echobridge-asr-vllm` 的 `/health`；
+  当 `qwen3` 时检查 `echobridge-asr` 的 `/healthz`；
 - TTS `/health`（vLLM）或 `/healthz`（HF）；
 - 冷启动宽限 `ECHOBRIDGE_WATCHDOG_GRACE_S`（默认 300 s）：`Type=simple` 的 worker 刚启动就显示 active，但模型可能还在加载；宽限期内不重启，避免把正在加载的 TTS 反复杀掉；
 - 进程崩溃由 systemd `Restart=always` 兜底；watchdog 只处理“进程在但无响应”。
@@ -206,9 +215,10 @@ systemctl --user start echobridge-watchdog.timer
 日志：
 
 ```bash
-journalctl --user -u echobridge-gateway -f   # 含 inprocess ASR/TTS 日志
+journalctl --user -u echobridge-gateway -f   # 含 inprocess ASR 日志
 journalctl --user -u echobridge-tts -f
-journalctl --user -u echobridge-asr -f        # 仅 qwen3 回退模式
+journalctl --user -u echobridge-asr-vllm -f   # ASR_BACKEND=vllm
+journalctl --user -u echobridge-asr -f        # qwen3 回退模式
 journalctl --user -u echobridge-watchdog -n 50
 ```
 
@@ -217,12 +227,16 @@ journalctl --user -u echobridge-watchdog -n 50
 ## 8. 启停与升级
 
 ```bash
-# WSL2（默认 inprocess：没有 ASR worker）
-systemctl --user restart echobridge-gateway
-systemctl --user stop echobridge-gateway echobridge-tts
+# WSL2（ASR_BACKEND=vllm）
+systemctl --user stop echobridge-gateway echobridge-asr-vllm echobridge-tts
+systemctl --user start echobridge-tts
+systemctl --user start echobridge-asr-vllm
+systemctl --user start echobridge-gateway
+
+# inprocess ASR：没有 ASR worker
 systemctl --user start echobridge-tts echobridge-gateway
 
-# qwen3 回退：再加上 echobridge-asr
+# qwen3 回退：把 echobridge-asr-vllm 换成 echobridge-asr
 systemctl --user start echobridge-asr echobridge-tts echobridge-gateway
 
 # 原生
@@ -233,10 +247,14 @@ sudo systemctl restart echobridge-gateway
 
 ```bash
 git pull
-systemctl --user restart echobridge-asr echobridge-tts echobridge-gateway
+systemctl --user stop echobridge-gateway
+systemctl --user restart echobridge-tts
+systemctl --user restart echobridge-asr-vllm
+systemctl --user start echobridge-gateway
 ```
 
-只改网关代码时可不重启模型 worker，模型保持常热。
+只改网关代码时可不重启模型 worker，模型保持常热。ASR/TTS 的 `Restart=always`
+会兜底崩溃；ASR 用固定 KV，热重启约 62 s。
 
 ## 9. 回退
 
@@ -262,7 +280,28 @@ bash scripts/dev.sh
 
 系统模式：`sudo bash deploy/uninstall.sh --system`。
 
-### 9.3 代码回退
+### 9.3 ASR 后端回退
+
+从 vLLM-ASR 回到 in-process：
+
+```bash
+sed -i 's/^ECHOBRIDGE_ASR_BACKEND=.*/ECHOBRIDGE_ASR_BACKEND=inprocess/' \
+  ~/.config/echobridge/echobridge.env
+bash deploy/install.sh --user
+```
+
+`install.sh` 会停用并禁用 `echobridge-asr-vllm`。**不要只改 env 不重装**：旧
+unit 仍可能被 gateway 的 `Wants=` 拉起，导致两份 ASR 同时占卡（约多 1.2 GiB）。
+
+如果保留了实验前的 env 备份：
+
+```bash
+cp -p ~/.config/echobridge/backup-20261029/echobridge.env \
+      ~/.config/echobridge/echobridge.env
+bash deploy/install.sh --user
+```
+
+### 9.4 代码回退
 
 ```bash
 git revert <phase-6-commit>

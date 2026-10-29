@@ -116,6 +116,10 @@ if [[ "$ASR_BACKEND" == "qwen3" ]]; then
   body="$(curl -fsS --max-time 3 "${ASR_URL%/}/healthz" 2>/dev/null || true)"
   grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' <<<"$body" || asr_ok=1
   check_unit echobridge-asr "$asr_ok" asr
+elif [[ "$ASR_BACKEND" == "vllm" ]]; then
+  asr_ok=0
+  curl -fsS --max-time 3 "${ASR_URL%/}/health" >/dev/null 2>&1 || asr_ok=1
+  check_unit echobridge-asr-vllm "$asr_ok" asr
 fi
 
 if [[ "$TTS_BACKEND" == "vllm" ]]; then

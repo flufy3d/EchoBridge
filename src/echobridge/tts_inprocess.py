@@ -12,8 +12,8 @@ What it does provide:
 * one process / one CUDA context shared with :class:`InProcessQwen3ASR`;
 * the voice-clone prompt tensors live on the GPU, so no 440 KB base64
   ``reference.wav`` is sent per sentence;
-* true streaming decode: first 1 codec frame, then 25-frame chunks with a
-  72-frame left context (mirroring ``deploy/qwen3_tts_echobridge.yaml``);
+* true streaming decode with a 2/4/8/12/25-frame ramp and a 72-frame left
+  context (mirroring ``deploy/qwen3_tts_echobridge.yaml``);
 * cooperative cancellation between talker steps (barge-in).
 
 No audio is ever played by this module or its benchmarks.
@@ -97,6 +97,14 @@ class InProcessQwen3TTS:
         self._max_new_tokens = max(8, settings.tts_max_new_tokens)
         self._initial = max(1, settings.tts_initial_codec_frames)
         self._chunk = max(1, settings.tts_codec_chunk_frames)
+        ramp = tuple(v for v in settings.tts_codec_chunk_ramp if v > 0)
+        if not ramp:
+            ramp = (self._initial,)
+        if ramp[-1] != self._chunk:
+            # vLLM-Omni warns that a ramp whose last entry does not match
+            # codec_chunk_frames reintroduces the chunk-size cliff.
+            ramp = ramp + (self._chunk,)
+        self._ramp = ramp
         self._left = max(0, settings.tts_codec_left_context_frames)
         self._scheduler = get_gpu_scheduler()
         self._model: Any = None
@@ -554,7 +562,8 @@ class InProcessQwen3TTS:
         collected = bytearray()
         emitted = 0
         canceled = False
-        next_end = min(self._initial, self._max_new_tokens)
+        ramp_index = 0
+        next_end = min(self._ramp[0], self._max_new_tokens)
         try:
             while state.step < self._max_new_tokens:
                 done = await self._scheduler.run(
@@ -579,7 +588,9 @@ class InProcessQwen3TTS:
                         priority=PRIORITY_TTS,
                         timeout=self._settings.tts_timeout_s,
                     )
-                    next_end = min(emitted + self._chunk, self._max_new_tokens)
+                    ramp_index += 1
+                    size = self._ramp[min(ramp_index, len(self._ramp) - 1)]
+                    next_end = min(emitted + size, self._max_new_tokens)
                     if pcm:
                         collected.extend(pcm)
                         for chunk in _blocks(pcm):

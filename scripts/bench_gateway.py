@@ -157,6 +157,33 @@ def percentile(values: list[float], p: float) -> float | None:
     return ordered[index]
 
 
+AUDIO_FRAME_MS = 20.0
+
+
+def audio_continuity(arrivals: list[float]) -> tuple[float, float]:
+    """Total and worst gap in the pacer's 20 ms frame stream.
+
+    A pacer that is fed slower than real time still emits frames until its
+    queue empties; the client then hears nothing until the next TTS packet.
+    ``stall_ms`` is the sum of those holes, ``gap_max_ms`` the worst one.
+    """
+    if len(arrivals) < 2:
+        return 0.0, 0.0
+    frame_s = AUDIO_FRAME_MS / 1000.0
+    play_until = arrivals[0] + frame_s
+    stall = 0.0
+    gap_max = 0.0
+    for when in arrivals[1:]:
+        if when > play_until:
+            gap = when - play_until
+            stall += gap
+            gap_max = max(gap_max, gap)
+            play_until = when + frame_s
+        else:
+            play_until += frame_s
+    return round(stall * 1000.0, 1), round(gap_max * 1000.0, 1)
+
+
 def stats(values: list[float]) -> dict[str, float | None]:
     present = [float(value) for value in values if value is not None]
     if not present:
@@ -184,6 +211,7 @@ class TurnRecorder:
         self.response_id = ""
         self.done = asyncio.Event()
         self.tool_hops = 0
+        self.audio_arrivals: list[float] = []
         self.transcript_chars = 0
         self.transcription_failed = False
         self.error = ""
@@ -216,6 +244,7 @@ class TurnRecorder:
                     self.t_first_audio = self.t_first_audio or now
                 elif kind == "response.output_audio.delta":
                     self.t_first_audio = self.t_first_audio or now
+                    self.audio_arrivals.append(now)
                 elif kind == "response.function_call_arguments.done":
                     await self._send_tool_results(event)
                 elif kind == "response.done":
@@ -224,6 +253,7 @@ class TurnRecorder:
                         # The continuation response has new metrics.
                         self.t_first_text = 0.0
                         self.t_first_audio = 0.0
+                        self.audio_arrivals.clear()
                         self.response_id = event.get("response_id", self.response_id)
                         continue
                     self.t_done = now
@@ -274,9 +304,14 @@ class TurnRecorder:
         backchannel = after_asr(self.t_backchannel)
         perceived_candidates = [value for value in (backchannel, formal) if value is not None]
         perceived = min(perceived_candidates) if perceived_candidates else None
+        stall_ms, gap_max_ms = audio_continuity(self.audio_arrivals)
         return {
             "transcript_chars": self.transcript_chars,
             "tool_hops": self.tool_hops,
+            "audio_frames": len(self.audio_arrivals),
+            "audio_s": round(len(self.audio_arrivals) * AUDIO_FRAME_MS / 1000.0, 2),
+            "audio_stall_ms": stall_ms,
+            "audio_gap_max_ms": gap_max_ms,
             "asr_final_from_speech_ms": round(
                 (self.t_completed - self.t_speech_end) * 1000.0, 1
             )
@@ -593,6 +628,11 @@ async def run(args: argparse.Namespace) -> int:
             [turn.get("perceived_after_asr_ms") for turn in ok_turns]
         ),
         "total_ms": stats([turn.get("total_ms") for turn in ok_turns]),
+        "audio_stall_ms": stats([turn.get("audio_stall_ms") for turn in ok_turns]),
+        "audio_gap_max_ms": stats(
+            [turn.get("audio_gap_max_ms") for turn in ok_turns]
+        ),
+        "audio_s": stats([turn.get("audio_s") for turn in ok_turns]),
         "endpoint_to_formal_audio_ms": stats(
             [
                 turn["asr_after_endpoint_est_ms"] + turn["first_audio_after_asr_ms"]

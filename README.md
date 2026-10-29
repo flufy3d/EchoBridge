@@ -6,14 +6,13 @@ EchoBridge connects streaming ASR, LLM, and TTS services through a unified
 Realtime API, so an existing Doubao-style client can talk to a locally hosted
 voice stack with minimal changes.
 
-> 🚧 **Status: Phase 7.** Gateway+VAD+ASR now run in one process and share one
-> CUDA context; vLLM-Omni is tuned for a strict single-session 8 GiB GPU; an
-> experimental fully in-process TTS backend is available. On an RTX 3070:
-> whole-card VRAM **7473 → 6571 MiB**, formal first-audio p95 **2474 → 1559 ms**,
-> TTS first-packet p50 **300–357 ms**, RTF p50 **0.301–0.423**. The ASR
-> 350–500 ms target is bounded by the 0.6B model itself; measurements, the
-> latency-first profile, and the in-process TTS trade-off are in
-> [`docs/PHASE7.md`](docs/PHASE7.md).
+> 🚧 **Status: Phase 8.** LLM thinking is off by default, the LLM connection is
+> kept warm, TTS uses a 2/4/8/12/25-frame ramp (no post-first-packet hole), and
+> Qwen3-ASR can run as a second vLLM process with a fixed 256 MiB KV cache.
+> On an RTX 3070: ASR after endpoint **908 → 114 ms**, formal first audio
+> **1185 → 768 ms**, TTS first-packet gap **500–880 → 0–16 ms**, whole-card VRAM
+> **6695 MiB** with TTS+ASR+gateway. vLLM-ASR is opt-in; in-process ASR remains
+> the fallback. Details: [`docs/PHASE8.md`](docs/PHASE8.md).
 
 ---
 
@@ -74,28 +73,26 @@ VAD) and the vLLM-Omni TTS server. Setting
 
 ## Performance snapshot
 
-Host: RTX 3070 8 GiB, WSL2 Ubuntu 26.04, 30-turn real ASR/TTS/DeepSeek session,
-no playback. Full data and methodology: [`docs/PHASE7.md`](docs/PHASE7.md).
+Host: RTX 3070 8 GiB, WSL2 Ubuntu 26.04, real ASR/TTS/DeepSeek turns, no
+playback. Phase 8 numbers are a 6-turn smoke run with one tool hop; full
+methodology and the Phase 7 30-turn baseline are in
+[`docs/PHASE8.md`](docs/PHASE8.md) and [`docs/PHASE7.md`](docs/PHASE7.md).
 
-| Metric | Before | Phase 7 default |
+| Metric | Phase 7 | Phase 8 (vLLM ASR) |
 |---|---:|---:|
-| Whole-card VRAM (`nvidia-smi`) | 7473 MiB | **6571 MiB** |
-| Cold start to ready | ~4 min 45 s | **~3 min 15 s** |
-| ASR after endpoint p50 | 858 ms | **908 ms** |
-| ASR after endpoint p95 | 1300 ms | **1176 ms** |
-| Formal first audio p50 | 1231 ms | **1185 ms** |
-| Formal first audio p95 | 2474 ms | **1559 ms** |
-| TTS first packet p50 | 240–440 ms | **300–357 ms** |
-| TTS RTF p50 | 0.35–0.545 | **0.301–0.423** |
+| Whole-card VRAM (`nvidia-smi`) | 6571 MiB | **6695 MiB** |
+| Cold start to ready | ~3 min 15 s | **~2 min 52 s** |
+| ASR after endpoint p50 | 908 ms | **114 ms** |
+| Formal first audio p50 (after ASR) | 1185 ms | **768 ms** |
+| TTS first packet p50 | 300–357 ms | **270–460 ms** |
+| TTS first-packet gap | 500–880 ms | **0–16 ms p50 / 62 ms max** |
+| TTS RTF p50 | 0.301–0.423 | **0.34–0.53** |
+| ASR 4 s while TTS generates | — | **768 ms** (102 ms idle) |
 
-The ASR after-endpoint target of 350–500 ms is **not fully met**: direct
-in-process ASR on the 4 s benchmark segments takes 848–1182 ms even with no TTS
-or HTTP. Setting `ECHOBRIDGE_VAD_PRE_ROLL_MS=300` gives p50 652 ms / p95 972 ms
-at the cost of the soft-onset pre-roll; see the Phase 7 report for the trade-off.
-
-The experimental all-in-one mode (`ASR_BACKEND=inprocess`,
-`TTS_BACKEND=inprocess`) uses about **4517 MiB** and is ready in **~62 s**, but
-pure-PyTorch TTS RTF is ~4, so it is not the default.
+The in-process ASR path still takes about 900 ms after endpoint. It remains the
+fallback when the extra ~2.3 GiB for vLLM-ASR is not available. The experimental
+all-in-one mode (`ASR_BACKEND=inprocess`, `TTS_BACKEND=inprocess`) uses about
+**4517 MiB** and is ready in **~62 s**, but pure-PyTorch TTS RTF is ~4.
 
 ## Quick start
 

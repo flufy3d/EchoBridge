@@ -1,0 +1,35 @@
+[Unit]
+Description=EchoBridge ASR worker (Qwen3-ASR via vLLM)
+Documentation=file://@ROOT@/docs/DEPLOY.md
+# Load the ASR model only after the TTS worker is ready (its ExecStartPost
+# waits for /health).  vLLM-Omni still sizes the TTS KV cache from free-memory
+# deltas, so an ASR model loading at the same time would corrupt that
+# measurement.  After= without Wants= is only an ordering hint, so this unit
+# still starts on its own when the TTS worker is not part of the transaction.
+After=network-online.target echobridge-tts.service
+Wants=network-online.target
+# The launcher fails fast when the port is taken or the card is full; keep
+# retrying instead of giving up after a burst.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@ROOT@
+Environment=HOME=@HOME@
+EnvironmentFile=@ENV_FILE@
+ExecStart=/bin/bash @ROOT@/scripts/asr_vllm.sh
+ExecStartPost=/bin/bash @ROOT@/deploy/worker-ready.sh asr
+Restart=always
+# GPU memory is back within ~2 s of the old process exiting (measured after
+# SIGKILL); the launcher's nvidia-smi check covers anything slower.
+RestartSec=15
+# Covers the launcher's GPU wait (<=180 s), model load and warm-up.
+TimeoutStartSec=600
+TimeoutStopSec=45
+KillMode=control-group
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=@WANTED_BY@

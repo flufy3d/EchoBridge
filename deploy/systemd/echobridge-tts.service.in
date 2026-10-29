@@ -14,8 +14,13 @@ Environment=HOME=@HOME@
 Environment=PYTHONPATH=@ROOT@/src
 EnvironmentFile=@ENV_FILE@
 ExecStart=/bin/bash @ROOT@/scripts/tts_vllm.sh
+# Stay "activating" until /health answers, so units ordered After= this one
+# (the vLLM ASR worker) wait for a ready TTS instead of a forked process.
+ExecStartPost=/bin/bash @ROOT@/deploy/worker-ready.sh tts
 Restart=always
 RestartSec=8
+# Two-stage model load plus CUDA graph capture takes ~2 min on a 3070.
+TimeoutStartSec=600
 TimeoutStopSec=45
 KillMode=control-group
 LimitNOFILE=65535

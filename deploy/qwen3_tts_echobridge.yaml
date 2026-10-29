@@ -32,15 +32,19 @@ connectors:
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
-      # Emit only the first audio chunk early, then return to codec_chunk_frames.
-      initial_codec_chunk_frames: 1
-      # Chunk ramp (opt-in): gradual size increase for first N chunks to
-      # eliminate the IC→steady cliff (1→25). Uncomment to enable.
+      # Chunk ramp: gradual size increase for the first N chunks.  A flat
+      # 1 -> 25 step emits 80 ms of audio and then waits 0.4-0.7 s for the
+      # next 2 s chunk, which sounds like a syllable followed by a pause.
+      # 2/4/8/12/25 starts with 160 ms of audio (not 80 ms) and fills the
+      # playout buffer faster than it drains.  The first packet still arrives
+      # at ~300 ms, but the next packet no longer leaves an audible hole:
+      # measured p50 gap 0-16 ms, max 62 ms, versus 500-880 ms with a flat
+      # 1 -> 25 step.  A 8 -> 16 jump was also tried and stalled 0.2-0.9 s;
+      # a 12-frame step before the steady 25-frame chunk avoids that cliff.
       # Each entry is the size of that chunk index; indices past the table
       # fall back to codec_chunk_frames. When enabled, ramp overrides
       # initial_codec_chunk_frames (including the per-request API field).
-      # Example:
-      #   codec_chunk_ramp: [4, 4, 8, 16, 25]
+      codec_chunk_ramp: [2, 4, 8, 12, 25]
       # Adaptive chunk ramp (opt-in, takes precedence over fixed codec_chunk_ramp):
       # Chunk 0 uses dynamic IC; chunk 1+ sizes from live buffer-depth feedback.
       # Self-tunes across hardware (NPU/NVIDIA) and load conditions.
