@@ -29,7 +29,7 @@ from .llm import MockLLM
 from .llm_deepseek import DeepSeekLLM, build_system_prompt
 from .logging import get_logger
 from .pacer import AudioPacer
-from .text import is_stop_command, split_for_tts
+from .text import clean_for_tts, is_stop_command, pop_tts_chunk, split_for_tts
 from .tools import available_tool_names, convert_tools
 from .tts import TTSBackend
 from .vad import VADBackend, VADEvent, make_vad
@@ -956,13 +956,21 @@ class Session:
                     if not await self._send(protocol.text_delta(ctx, delta), ctx=ctx):
                         return full
                 buffer += delta
-                limit = 15 if first_chunk else 18
-                if self._should_flush(buffer, limit):
-                    await self._synthesize_into(pacer, buffer, ctx)
-                    buffer = ""
+                # Extract every complete clause currently available.  The
+                # helper returns the incomplete tail as the new buffer, so a
+                # comma never sends half a clause or half a word to TTS.
+                while True:
+                    chunk, buffer = pop_tts_chunk(
+                        buffer, first_chunk=first_chunk
+                    )
+                    if not chunk:
+                        break
+                    await self._synthesize_into(pacer, chunk, ctx)
                     first_chunk = False
+            # Stream ended: flush the tail through the complete-text splitter.
             if buffer.strip():
-                await self._synthesize_into(pacer, buffer, ctx)
+                for chunk in split_for_tts(buffer):
+                    await self._synthesize_into(pacer, chunk, ctx)
             await pacer.finish()
             if emit_text and full:
                 await self._send(protocol.text_done(ctx, full), ctx=ctx)
@@ -1055,15 +1063,19 @@ class Session:
     async def _synthesize_into(
         self, pacer: AudioPacer, text: str, ctx: protocol.ResponseContext
     ) -> None:
+        # Streaming chunks still need the same URL/markdown/emoji cleanup the
+        # final splitter used to apply; never synthesize raw markdown.
+        chunk = clean_for_tts(text)
+        if not chunk:
+            return
         first_pcm = True
-        for chunk in split_for_tts(text) or [text]:
-            async for pcm in self._tts.synthesize(chunk, self._voice, ctx.generation):
-                if first_pcm:
-                    first_pcm = False
-                    if self._first_audio_generation != ctx.generation:
-                        self._first_audio_generation = ctx.generation
-                        self._log_first_audio(ctx)
-                await pacer.feed(pcm)
+        async for pcm in self._tts.synthesize(chunk, self._voice, ctx.generation):
+            if first_pcm:
+                first_pcm = False
+                if self._first_audio_generation != ctx.generation:
+                    self._first_audio_generation = ctx.generation
+                    self._log_first_audio(ctx)
+            await pacer.feed(pcm)
 
     def _log_first_audio(self, ctx: protocol.ResponseContext) -> None:
         if self._turn_started_at is None:
@@ -1075,14 +1087,6 @@ class Session:
             elapsed_ms,
             "1" if self._backchannel_sent_generation == ctx.generation else "0",
         )
-
-    @staticmethod
-    def _should_flush(buffer: str, limit: int) -> bool:
-        if not buffer:
-            return False
-        if any(ch in "。！？!?；;\n" for ch in buffer):
-            return True
-        return len(buffer) >= limit
 
     async def _cancel_active(
         self,

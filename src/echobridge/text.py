@@ -1,4 +1,4 @@
-"""Text cleanup and sentence chunking for TTS."""
+"""Text cleanup and safe streaming chunking for TTS."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import unicodedata
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _MARKDOWN_RE = re.compile(r"[`*_#>\[\]]+")
 _SPACE_RE = re.compile(r"\s+")
-_SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?")
 _STOP_RE = re.compile(
     r"^(?:"
     r"停(?:一下|下|一停|停|下来)?"
@@ -25,6 +24,16 @@ _STOP_RE = re.compile(
     r")[。！？!?，,、；;：:\s吧啊呀~～]*$",
     re.IGNORECASE,
 )
+
+# Sentence-ending punctuation.  A split here is always a natural pause.
+_STRONG_PUNCT = frozenset("。！？!?；;\n")
+# Clause punctuation.  Safe for a first low-latency chunk or a long clause.
+_CLAUSE_PUNCT = frozenset("，,、：:～~…")
+_ALL_PUNCT = _STRONG_PUNCT | _CLAUSE_PUNCT
+# Characters after which a no-punctuation Chinese cut is usually comfortable.
+_FUNCTION_WORDS = frozenset("的了吗呢吧呀啊和与在是有就都而但着过地得")
+# Never emit a chunk shorter than this unless it is the final remainder.
+_MIN_CHUNK_CHARS = 4
 
 
 def clean_for_tts(text: str) -> str:
@@ -74,30 +83,232 @@ def is_stop_command(text: str) -> bool:
     return False
 
 
-def split_for_tts(text: str, first_max: int = 15, next_max: int = 40) -> list[str]:
+def _is_ascii_word_char(char: str) -> bool:
+    return char.isascii() and (char.isalnum() or char in "_-'")
+
+
+def _is_numeric_punct(text: str, index: int) -> bool:
+    """True for comma/colon/tilde between digits (1,000 / 3:14 / 3~5)."""
+    if index <= 0 or index + 1 >= len(text):
+        return False
+    return (
+        text[index - 1].isdigit()
+        and text[index + 1].isdigit()
+        and text[index] in ",:：～~"
+    )
+
+
+def _safe_cut(text: str, index: int) -> bool:
+    """True when splitting ``text[:index]`` / ``text[index:]`` is word-safe."""
+    if index <= 0:
+        return False
+    if index >= len(text):
+        # At the current end of stream, an ASCII letter/digit may be an
+        # incomplete word ("Open" waiting for "AI"); wait for more deltas.
+        return not _is_ascii_word_char(text[-1])
+    left = text[index - 1]
+    right = text[index]
+    if _is_ascii_word_char(left) and _is_ascii_word_char(right):
+        return False
+    if (
+        left.isdigit()
+        and right in ".,．"
+        and index + 1 < len(text)
+        and text[index + 1].isdigit()
+    ):
+        return False
+    if (
+        left in ".,．"
+        and index >= 2
+        and text[index - 2].isdigit()
+        and right.isdigit()
+    ):
+        return False
+    if unicodedata.combining(right):
+        return False
+    return True
+
+
+def _effective_count(text: str) -> int:
+    return sum(
+        1
+        for char in text
+        if not char.isspace() and char not in _ALL_PUNCT
+    )
+
+
+def _strip_leading_noise(text: str) -> str:
+    text = text.lstrip()
+    while text and text[0] in _ALL_PUNCT:
+        text = text[1:].lstrip()
+    return text
+
+
+def _find_punct_index(
+    text: str, punct: frozenset[str], min_effective: int
+) -> int | None:
+    effective = 0
+    for index, char in enumerate(text):
+        if char in punct:
+            if _is_numeric_punct(text, index):
+                continue
+            if effective >= min_effective:
+                return index
+        elif not char.isspace() and char not in _ALL_PUNCT:
+            effective += 1
+    return None
+
+
+def _consume_punct_run(text: str, index: int) -> int:
+    """Consume repeated punctuation (……, 。」, etc.) after a split point."""
+    index += 1
+    while index < len(text) and text[index] in _ALL_PUNCT:
+        index += 1
+    return index
+
+
+def _find_safe_hard_cut(text: str, cap: int) -> int | None:
+    """Find a word-safe cut at/near ``cap`` without punctuation.
+
+    Preference order: the last function-word boundary inside the cap, then the
+    last whitespace, then any safe character boundary.  If the cap falls inside
+    an ASCII word or number, scan forward for its natural end instead of
+    breaking it.
+    """
+    limit = min(len(text), cap)
+    # Function words first: "看到了" is a much better pause than "看到".
+    for index in range(limit - 1, _MIN_CHUNK_CHARS - 1, -1):
+        if text[index] in _FUNCTION_WORDS:
+            cut = index + 1
+            if cut >= _MIN_CHUNK_CHARS and _safe_cut(text, cut):
+                return cut
+    # Then whitespace (English words / mixed text).
+    for index in range(limit - 1, _MIN_CHUNK_CHARS - 1, -1):
+        if text[index].isspace():
+            cut = index + 1
+            if cut >= _MIN_CHUNK_CHARS:
+                return cut
+    # Chinese characters are safe at almost any character boundary; this is
+    # the last resort before waiting for a natural delimiter.
+    for index in range(limit, _MIN_CHUNK_CHARS - 1, -1):
+        if _safe_cut(text, index):
+            return index
+    # The cap is inside a long ASCII token.  Wait until the token ends, then
+    # cut after its delimiter rather than splitting "Open" + "AI".
+    for index in range(cap, len(text)):
+        if text[index].isspace() or text[index] in _ALL_PUNCT:
+            cut = index + 1
+            if _safe_cut(text, cut):
+                return cut
+    return None
+
+
+def pop_tts_chunk(
+    buffer: str,
+    *,
+    first_chunk: bool,
+    first_soft_max: int = 15,
+    first_hard_max: int = 22,
+    next_clause_min: int = 24,
+    next_hard_max: int = 36,
+) -> tuple[str, str]:
+    """Pop one safe TTS chunk, returning ``(chunk, remaining_buffer)``.
+
+    The remaining buffer always keeps the incomplete tail after the split, so a
+    comma never sends half a clause to TTS.  When no safe boundary exists yet
+    (e.g. a long English token), it returns ``("", buffer)`` and the caller
+    waits for more LLM deltas.
+    """
+    buffer = _strip_leading_noise(buffer)
+    if not buffer:
+        return "", ""
+
+    if first_chunk:
+        # Low-latency first clause: split at the earliest strong/clause
+        # punctuation once at least four effective characters precede it.
+        strong = _find_punct_index(buffer, _STRONG_PUNCT, _MIN_CHUNK_CHARS)
+        clause = _find_punct_index(buffer, _CLAUSE_PUNCT, _MIN_CHUNK_CHARS)
+        candidates = [index for index in (strong, clause) if index is not None]
+        if candidates:
+            end = _consume_punct_run(buffer, min(candidates))
+            return buffer[:end].strip(), buffer[end:]
+
+        effective = _effective_count(buffer)
+        # Soft boundary preserves the old ~15-character first-audio latency
+        # without ever ending in the middle of a word.
+        if effective >= first_soft_max:
+            cut = _find_safe_hard_cut(buffer, first_soft_max)
+            if cut is not None:
+                return buffer[:cut].strip(), buffer[cut:]
+        if effective >= first_hard_max:
+            cut = _find_safe_hard_cut(buffer, first_hard_max)
+            if cut is not None:
+                return buffer[:cut].strip(), buffer[cut:]
+        return "", buffer
+
+    # Subsequent chunks: complete sentences first.
+    strong = _find_punct_index(buffer, _STRONG_PUNCT, 1)
+    if strong is not None:
+        end = _consume_punct_run(buffer, strong)
+        return buffer[:end].strip(), buffer[end:]
+
+    # A long clause with commas: split at the *last* clause punctuation and
+    # keep everything after it for the next LLM delta.
+    if _effective_count(buffer) >= next_clause_min:
+        last = None
+        for index, char in enumerate(buffer):
+            if char in _CLAUSE_PUNCT and not _is_numeric_punct(buffer, index):
+                last = index
+        if last is not None and last + 1 >= _MIN_CHUNK_CHARS:
+            end = _consume_punct_run(buffer, last)
+            return buffer[:end].strip(), buffer[end:]
+
+    # No punctuation: only cut at the hard cap, at a word/function boundary.
+    if _effective_count(buffer) >= next_hard_max:
+        cut = _find_safe_hard_cut(buffer, next_hard_max)
+        if cut is not None:
+            return buffer[:cut].strip(), buffer[cut:]
+    return "", buffer
+
+
+def _has_speakable_text(text: str) -> bool:
+    return any(
+        not char.isspace() and char not in _ALL_PUNCT for char in text
+    )
+
+
+def split_for_tts(
+    text: str,
+    first_max: int = 22,
+    next_max: int = 36,
+    clause_min: int = 24,
+) -> list[str]:
+    """Split a complete string with the same safe boundaries as streaming.
+
+    Used for the final flush after the LLM stream ends; it never cuts inside an
+    English word or a decimal number.
+    """
     text = clean_for_tts(text)
     if not text:
         return []
-    raw = [chunk.strip() for chunk in _SENTENCE_RE.findall(text) if chunk.strip()]
-    if not raw:
-        raw = [text]
     chunks: list[str] = []
-    for sentence in raw:
-        if len(sentence) <= (first_max if not chunks else next_max):
-            chunks.append(sentence)
-            continue
-        limit = first_max if not chunks else next_max
-        start = 0
-        while start < len(sentence):
-            end = min(len(sentence), start + limit)
-            if end < len(sentence):
-                # Prefer a comma/顿号 break near the limit.
-                window = sentence[start:end]
-                split_at = max(window.rfind("，"), window.rfind(","), window.rfind("、"))
-                if split_at >= max(3, limit // 3):
-                    end = start + split_at + 1
-            piece = sentence[start:end].strip()
-            if piece:
-                chunks.append(piece)
-            start = end
+    buffer = text
+    first = True
+    while buffer.strip():
+        chunk, remaining = pop_tts_chunk(
+            buffer,
+            first_chunk=first,
+            first_hard_max=first_max,
+            next_hard_max=next_max,
+            next_clause_min=clause_min,
+        )
+        if not chunk:
+            break
+        if _has_speakable_text(chunk):
+            chunks.append(chunk)
+        buffer = remaining
+        first = False
+    tail = buffer.strip()
+    if tail and _has_speakable_text(tail):
+        chunks.append(tail)
     return chunks
