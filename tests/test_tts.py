@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import base64
+import json
 
 from echobridge.tts import MockTTS, VLLMTTSClient
-from tests.helpers import make_settings, make_voice_registry
+from tests.helpers import make_settings, make_voice_registry, write_wav
 
 
 async def _collect(tts, text: str, voice: str) -> bytes:
@@ -89,3 +90,62 @@ async def test_vllm_cached_uses_default_for_empty_voice(tmp_path):
         assert client.cached("你好", "unknown_voice") is None
     finally:
         await client.close()
+
+
+async def test_backchannel_clips_are_pinned_without_synthesis(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    clip_dir = tmp_path / "backchannel" / "mingyue_v1"
+    write_wav(clip_dir / "think.wav", sample_rate=24_000, duration_ms=400)
+    (clip_dir / "clips.json").write_text(
+        json.dumps({"我想想～": "think.wav", "unused": "missing.wav"}),
+        encoding="utf-8",
+    )
+    settings = make_settings(
+        tts_backend="vllm",
+        tts_url="http://127.0.0.1:9",
+        tts_voice_dir=str(tmp_path),
+        backchannel_phrases=("我想想～", "这个嘛～"),
+    )
+    client = VLLMTTSClient(settings, registry)
+    try:
+        clip = client.cached("我想想～", "mingyue_v1")
+        assert clip is not None and len(clip) > 0
+        # Phrases without a clip, and other voices, still go through TTS.
+        assert client.cached("这个嘛～", "mingyue_v1") is None
+        assert client.cached("我想想～", "mingyue_xixi_v1") is None
+
+        synthesized: list[str] = []
+
+        async def fake_prefetch(text: str, voice: str) -> bytes:
+            synthesized.append(text)
+            return b"\x00\x01" * 100
+
+        client._prefetch = fake_prefetch  # type: ignore[method-assign]
+        await client.ensure_warm("mingyue_v1")
+        assert "我想想～" not in synthesized
+        assert "这个嘛～" in synthesized
+        assert client.cached("我想想～", "mingyue_v1") == clip
+    finally:
+        await client.close()
+
+
+async def test_backchannel_clips_ignored_when_disabled(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    clip_dir = tmp_path / "backchannel" / "mingyue_v1"
+    write_wav(clip_dir / "think.wav", sample_rate=24_000, duration_ms=400)
+    (clip_dir / "clips.json").write_text(
+        json.dumps({"我想想～": "think.wav"}), encoding="utf-8"
+    )
+    settings = make_settings(
+        tts_backend="vllm",
+        tts_url="http://127.0.0.1:9",
+        tts_voice_dir=str(tmp_path),
+        backchannel_enabled=False,
+        backchannel_phrases=("我想想～",),
+    )
+    client = VLLMTTSClient(settings, registry)
+    try:
+        assert client.cached("我想想～", "mingyue_v1") is None
+    finally:
+        await client.close()
+

@@ -56,6 +56,36 @@ def silence_pcm16(milliseconds: int, sample_rate: int = 24_000) -> bytes:
     return b"\x00\x00" * samples
 
 
+def trim_silence_pcm16(
+    pcm: bytes,
+    sample_rate: int = 24_000,
+    threshold: int = 300,
+    window_ms: int = 10,
+    lead_pad_ms: int = 60,
+    tail_pad_ms: int = 100,
+) -> bytes:
+    """Trim leading/trailing silence, keeping a short pad on each side.
+
+    Qwen3-TTS often renders a single-syllable filler ("嗯～") as 0.3 s of
+    voice wrapped in up to 1 s of silence; the leading part is pure latency.
+    Inner pauses are kept.  Returns ``pcm`` unchanged if nothing is voiced.
+    """
+    pcm = pcm[: len(pcm) - (len(pcm) % 2)]
+    window = max(2, int(sample_rate * window_ms / 1000) * 2)
+    voiced = [
+        offset
+        for offset in range(0, len(pcm), window)
+        if rms_pcm16(pcm[offset : offset + window]) >= threshold
+    ]
+    if not voiced:
+        return pcm
+    lead_pad = int(sample_rate * lead_pad_ms / 1000) * 2
+    tail_pad = int(sample_rate * tail_pad_ms / 1000) * 2
+    start = max(0, voiced[0] - lead_pad)
+    end = min(len(pcm), voiced[-1] + window + tail_pad)
+    return pcm[start:end]
+
+
 def linear_resample_pcm16(pcm: bytes, source_rate: int, target_rate: int) -> bytes:
     if source_rate == target_rate or not pcm:
         return pcm

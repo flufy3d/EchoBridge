@@ -71,10 +71,23 @@ echobridge_voice_id        默认 mingyue_v1（别名 localVoiceId）
 ### 4.1 主机侧
 
 - `ECHOBRIDGE_BACKCHANNEL_ENABLED=1`（默认）。
-- `ECHOBRIDGE_BACKCHANNEL_DELAY_MS=700`（可配置）。
-- `ECHOBRIDGE_BACKCHANNEL_PHRASES="嗯～|唔～|我想想～"`（`|` 分隔）。
+- `ECHOBRIDGE_BACKCHANNEL_DELAY_MS=1500`（可配置）。2026-10-29 从 700 调到
+  1500：7 天线上 225 轮正式回答没有一轮在 0.7 s 内出声，中位 1.8 s，
+  其中 96 轮在 1.5 s 内；700 ms 时短音几乎每轮都响，且设备要等短音播完
+  才放正式回答，反而拖慢了快的轮次。
+- `ECHOBRIDGE_BACKCHANNEL_PHRASES="嗯…让我想想|我想想～|这个嘛～|我看看哦～"`
+  （`|` 分隔）。单字“嗯～/唔～”被 Qwen3-TTS 合成为约 0.3 s 有声 +
+  0.6–1 s 前导静音，听起来短促且没有思考感，已弃用。
+- 手选录音（可选）：`ECHOBRIDGE_BACKCHANNEL_CLIP_DIR`，默认
+  `<ECHOBRIDGE_TTS_VOICE_DIR>/backchannel`；布局
+  `<dir>/<voice_id>/clips.json`（`{"短语": "file.wav"}`）。有录音的短语
+  不再每次 warmup 重新合成（同一短语每次合成长短差异很大，0.8–7 s）；
+  没有录音的音色/短语仍走 TTS。生产机 `mingyue_v1` 的 4 条录音在
+  `~/.cache/echobridge/voices/mingyue/backchannel/mingyue_v1/`。
+- 录音和合成结果都会切掉首尾静音（保留 60 ms / 100 ms），中间停顿保留；
+  每条应 ≤ 2 s，否则设备会在正式回答开始时淡出它。
 - 启动时 TTS warmup 预合成 greeting 和全部短音；`app.py` 改为全后端共享一个 TTS client，缓存不再随会话丢失。
-- ASR final 后 700 ms，若正式 TTS 首个 chunk 尚未产生且本轮未发过短音：
+- ASR final 后 1500 ms，若正式 TTS 首个 chunk 尚未产生且本轮未发过短音：
   - 从预缓存取一条（排除上一轮用过的）；
   - 发独立事件 `response.backchannel`（带 `response_id/sound_id/format/delta`），**不进 pacer、不参与正式 response 的 audio/文本状态机**；
   - 每轮最多 1 条；工具 hop 后不重复。

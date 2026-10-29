@@ -123,12 +123,24 @@ class Settings:
     mock_tts_wav: str | None = None
     tool_timeout_s: float = 25.0
 
-    # Natural backchannel ("嗯～") played when the real answer is slow.  It is
-    # cached at TTS warmup and sent as a separate response.backchannel event so
-    # it never shares the formal response's pacer/queue.
+    # Natural backchannel ("我想想～") played when the real answer is slow.  It
+    # is cached at TTS warmup and sent as a separate response.backchannel event
+    # so it never shares the formal response's pacer/queue.  Formal audio never
+    # starts within 0.7 s and half the turns start within 1.5 s, so a shorter
+    # delay makes the filler fire on almost every turn and delays fast answers.
     backchannel_enabled: bool = True
-    backchannel_delay_ms: int = 700
-    backchannel_phrases: tuple[str, ...] = ("嗯～", "唔～", "我想想～")
+    backchannel_delay_ms: int = 1500
+    backchannel_phrases: tuple[str, ...] = (
+        "嗯…让我想想",
+        "我想想～",
+        "这个嘛～",
+        "我看看哦～",
+    )
+    # Hand-picked recordings: ``<dir>/<voice_id>/clips.json`` maps phrase ->
+    # WAV file.  A phrase with a clip skips TTS synthesis for that voice (one
+    # synthesis per warmup varies a lot between takes).  Empty means
+    # ``<tts_voice_dir>/backchannel``.
+    backchannel_clip_dir: str = ""
 
     # Dev-only probe page (static HTML; no secrets).
     enable_probe: bool = True
@@ -226,11 +238,14 @@ class Settings:
             mock_tts_wav=os.environ.get("ECHOBRIDGE_MOCK_TTS_WAV") or None,
             tool_timeout_s=float(os.environ.get("ECHOBRIDGE_TOOL_TIMEOUT_S", "25")),
             backchannel_enabled=_env_bool("ECHOBRIDGE_BACKCHANNEL_ENABLED", True),
-            backchannel_delay_ms=_env_int("ECHOBRIDGE_BACKCHANNEL_DELAY_MS", 700),
+            backchannel_delay_ms=_env_int("ECHOBRIDGE_BACKCHANNEL_DELAY_MS", 1500),
             backchannel_phrases=_env_phrases(
                 "ECHOBRIDGE_BACKCHANNEL_PHRASES",
-                ("嗯～", "唔～", "我想想～"),
+                ("嗯…让我想想", "我想想～", "这个嘛～", "我看看哦～"),
             ),
+            backchannel_clip_dir=os.environ.get(
+                "ECHOBRIDGE_BACKCHANNEL_CLIP_DIR", ""
+            ).strip(),
             enable_probe=_env_bool("ECHOBRIDGE_ENABLE_PROBE", True),
             log_level=os.environ.get("ECHOBRIDGE_LOG_LEVEL", "INFO").upper(),
         )

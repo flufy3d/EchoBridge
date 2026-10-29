@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import zlib
 from collections import OrderedDict
@@ -17,7 +18,12 @@ from typing import Protocol
 
 import httpx
 
-from .audio import load_wav_mono_24k, silence_pcm16, tone_pcm16
+from .audio import (
+    load_wav_mono_24k,
+    silence_pcm16,
+    tone_pcm16,
+    trim_silence_pcm16,
+)
 from .config import Settings
 from .logging import get_logger
 from .voices import VoiceRegistry, VoiceSpec, load_voice_registry
@@ -25,6 +31,60 @@ from .voices import VoiceRegistry, VoiceSpec, load_voice_registry
 logger = get_logger("echobridge.tts")
 
 GREETING = "你来啦，我在呢。"
+
+
+def load_backchannel_clips(
+    settings: Settings, registry: VoiceRegistry
+) -> dict[tuple[str, str], bytes]:
+    """Load hand-picked backchannel recordings, keyed by (voice_id, phrase).
+
+    Layout: ``<clip_dir>/<voice_id>/clips.json`` mapping phrase -> WAV path
+    (relative to that file).  Only configured phrases are loaded; anything
+    missing or unreadable falls back to TTS synthesis at warmup.
+    """
+    if not settings.backchannel_enabled or not settings.backchannel_phrases:
+        return {}
+    root = Path(
+        os.path.expanduser(
+            settings.backchannel_clip_dir
+            or os.path.join(settings.tts_voice_dir, "backchannel")
+        )
+    )
+    clips: dict[tuple[str, str], bytes] = {}
+    for spec in registry.voices:
+        manifest = root / spec.id / "clips.json"
+        if not manifest.is_file():
+            continue
+        try:
+            entries = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("backchannel clips unreadable %s: %s", manifest, exc)
+            continue
+        if not isinstance(entries, dict):
+            logger.warning("backchannel clips must be an object: %s", manifest)
+            continue
+        for phrase in settings.backchannel_phrases:
+            name = entries.get(phrase)
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                pcm = trim_silence_pcm16(load_wav_mono_24k(manifest.parent / name))
+            except Exception as exc:
+                logger.warning(
+                    "backchannel clip failed voice=%s phrase=%r: %s",
+                    spec.id,
+                    phrase,
+                    exc,
+                )
+                continue
+            if pcm:
+                clips[(spec.id, phrase)] = pcm
+        logger.info(
+            "backchannel clips voice=%s loaded=%d",
+            spec.id,
+            sum(1 for voice, _ in clips if voice == spec.id),
+        )
+    return clips
 
 
 class TTSBackend(Protocol):
@@ -118,7 +178,9 @@ class Qwen3TTSClient:
             timeout=httpx.Timeout(settings.tts_timeout_s, connect=2.0),
         )
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
-        self._backchannel_cache: dict[tuple[str, str], bytes] = {}
+        self._backchannel_cache: dict[tuple[str, str], bytes] = (
+            load_backchannel_clips(settings, self._registry)
+        )
         self._cache_max = 8
         self._warm_locks = {
             spec.id: asyncio.Lock() for spec in self._registry.voices
@@ -183,8 +245,10 @@ class Qwen3TTSClient:
             except Exception as exc:
                 logger.warning("TTS greeting prewarm failed voice=%s: %s", voice, exc)
             for phrase in self._backchannel_phrases:
+                if (voice, phrase) in self._backchannel_cache:
+                    continue  # hand-picked clip
                 try:
-                    pcm = await self._fetch(phrase, voice)
+                    pcm = trim_silence_pcm16(await self._fetch(phrase, voice))
                     if pcm:
                         self._backchannel_cache[(voice, phrase)] = pcm
                 except Exception as exc:
@@ -261,7 +325,9 @@ class VLLMTTSClient:
         )
         self._api_key = settings.tts_api_key
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
-        self._backchannel_cache: dict[tuple[str, str], bytes] = {}
+        self._backchannel_cache: dict[tuple[str, str], bytes] = (
+            load_backchannel_clips(settings, self._registry)
+        )
         self._cache_max = 8
         self._warm_locks = {
             spec.id: asyncio.Lock() for spec in self._registry.voices
@@ -384,8 +450,10 @@ class VLLMTTSClient:
             except Exception as exc:
                 logger.warning("TTS greeting prewarm failed voice=%s: %s", voice, exc)
             for phrase in self._backchannel_phrases:
+                if (voice, phrase) in self._backchannel_cache:
+                    continue  # hand-picked clip
                 try:
-                    pcm = await self._prefetch(phrase, voice)
+                    pcm = trim_silence_pcm16(await self._prefetch(phrase, voice))
                     if pcm:
                         self._backchannel_cache[(voice, phrase)] = pcm
                 except Exception as exc:
