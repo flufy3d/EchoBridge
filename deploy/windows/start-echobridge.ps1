@@ -12,7 +12,8 @@ $ErrorActionPreference = "Stop"
 $wsl = Join-Path $env:SystemRoot "System32\wsl.exe"
 $script = @"
 export XDG_RUNTIME_DIR=/run/user/`$(id -u)
-systemctl --user start echobridge-asr.service echobridge-tts.service
+# The gateway's Wants= pulls in only the worker units selected by the installed
+# env (vLLM TTS and/or the legacy ASR worker).  In-process ASR/TTS need none.
 systemctl --user start echobridge-gateway.service
 systemctl --user start echobridge-watchdog.timer
 exec sleep infinity

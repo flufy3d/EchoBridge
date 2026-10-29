@@ -99,6 +99,7 @@ render() {
     -e "s|@ENV_FILE@|$ENV_FILE|g" \
     -e "s|@PYTHON@|$PYTHON|g" \
     -e "s|@WANTED_BY@|$WANTED_BY|g" \
+    -e "s|@WORKER_UNITS@|$WORKER_UNITS|g" \
     -e "s|@MODE@|$MODE_NAME|g" \
     "$src" >"$dst"
   if [[ "$MODE" == "user" ]]; then
@@ -145,6 +146,26 @@ if [[ "$MODE" == "system" ]]; then
   chown "$SERVICE_USER":"$SERVICE_USER" "$ENV_FILE"
 fi
 
+# In-process backends live inside the gateway; do not start (or even order
+# after) their legacy worker units.  Units stay rendered for explicit rollback
+# to ECHOBRIDGE_ASR_BACKEND=qwen3 / ECHOBRIDGE_TTS_BACKEND=vllm.
+ASR_BACKEND="$(grep -E '^ECHOBRIDGE_ASR_BACKEND=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+ASR_BACKEND="${ASR_BACKEND:-inprocess}"
+TTS_BACKEND="$(grep -E '^ECHOBRIDGE_TTS_BACKEND=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '[:space:]')"
+TTS_BACKEND="${TTS_BACKEND:-vllm}"
+WORKER_UNITS=""
+ASR_UNIT_ENABLE=0
+TTS_UNIT_ENABLE=0
+if [[ "$ASR_BACKEND" == "qwen3" ]]; then
+  WORKER_UNITS="$WORKER_UNITS echobridge-asr.service"
+  ASR_UNIT_ENABLE=1
+fi
+if [[ "$TTS_BACKEND" == "vllm" || "$TTS_BACKEND" == "qwen3" ]]; then
+  WORKER_UNITS="$WORKER_UNITS echobridge-tts.service"
+  TTS_UNIT_ENABLE=1
+fi
+WORKER_UNITS="${WORKER_UNITS# }"
+
 render "$ROOT/deploy/systemd/echobridge-gateway.service.in" "$UNIT_DIR/echobridge-gateway.service"
 render "$ROOT/deploy/systemd/echobridge-asr.service.in" "$UNIT_DIR/echobridge-asr.service"
 render "$ROOT/deploy/systemd/echobridge-tts.service.in" "$UNIT_DIR/echobridge-tts.service"
@@ -179,11 +200,27 @@ if ((STOP_LEGACY)); then
 fi
 
 "${SYSTEMCTL[@]}" daemon-reload
-"${SYSTEMCTL[@]}" enable echobridge-asr.service echobridge-tts.service echobridge-gateway.service echobridge-watchdog.timer >/dev/null
+ENABLE_UNITS=(echobridge-gateway.service echobridge-watchdog.timer)
+START_UNITS=()
+if ((ASR_UNIT_ENABLE)); then
+  ENABLE_UNITS=(echobridge-asr.service "${ENABLE_UNITS[@]}")
+  START_UNITS+=(echobridge-asr.service)
+else
+  "${SYSTEMCTL[@]}" disable --now echobridge-asr.service >/dev/null 2>&1 || true
+fi
+if ((TTS_UNIT_ENABLE)); then
+  ENABLE_UNITS=(echobridge-tts.service "${ENABLE_UNITS[@]}")
+  START_UNITS+=(echobridge-tts.service)
+else
+  "${SYSTEMCTL[@]}" disable --now echobridge-tts.service >/dev/null 2>&1 || true
+fi
+"${SYSTEMCTL[@]}" enable "${ENABLE_UNITS[@]}" >/dev/null
 
 if ((START)); then
-  echo "starting workers..."
-  "${SYSTEMCTL[@]}" restart echobridge-asr.service echobridge-tts.service
+  if ((${#START_UNITS[@]})); then
+    echo "starting workers..."
+    "${SYSTEMCTL[@]}" restart "${START_UNITS[@]}"
+  fi
   echo "starting gateway (waits up to 300 s for model workers)..."
   "${SYSTEMCTL[@]}" restart echobridge-gateway.service
   "${SYSTEMCTL[@]}" restart echobridge-watchdog.timer

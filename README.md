@@ -4,7 +4,14 @@
 
 A lightweight, model-agnostic voice gateway that connects streaming ASR, LLM, and TTS services through a unified Realtime API.
 
-> 🚧 **Status: Phase 6.** Deployment, health/readiness/metrics, systemd watchdog, Windows WSL autostart, Tailscale Serve WSS, and a 30-turn real ASR/TTS/LLM benchmark are complete. Host-controlled first-audio p50/p95 and perceived-first-audio targets are met or explicitly exempted; long-soak and device-side formal-tail gaps are documented in [`docs/BENCHMARK.md`](docs/BENCHMARK.md) and [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md). See [`docs/DEPLOY.md`](docs/DEPLOY.md) for installation and rollback.
+> 🚧 **Status: Phase 7.** The gateway now runs Qwen3-ASR in-process (one CUDA
+> context, no localhost HTTP/base64), vLLM-Omni is tuned for a single 8 GiB
+> session, and an experimental fully in-process TTS backend is available.
+> Whole-card VRAM dropped from 7473 to 6576 MiB; formal first-audio p95 dropped
+> from 2474 to 1559 ms. The ASR 350–500 ms target is bounded by the 0.6B model
+> itself and is documented with measurements and a latency-first profile. See
+> [`docs/PHASE7.md`](docs/PHASE7.md), [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
+> and [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ---
 
@@ -33,14 +40,14 @@ EchoBridge 是一个轻量级、开源、自托管的实时 AI 语音网关，�
 
 适用于 AI 虚拟角色、智能音箱、Android 设备和自定义语音助手。
 
-## Architecture (planned)
+## Architecture
 
 ```
 Client  ──WebSocket──▶  EchoBridge Gateway
-                          ├── VAD / turn detection
-                          ├── ASR  (Qwen3-ASR, ...)
+                          ├── VAD / turn detection (Silero, CPU ONNX)
+                          ├── ASR  (Qwen3-ASR, in-process by default)
                           ├── LLM  (DeepSeek / GLM / OpenAI-compatible)
-                          └── TTS  (Qwen3-TTS, voice cloning)
+                          └── TTS  (Qwen3-TTS via vLLM-Omni; optional in-process)
 ```
 
 ## Roadmap

@@ -10,14 +10,17 @@ X10A ── wss://work-pc.<tailnet>.ts.net:8443 ── Tailscale Serve（仅 tai
                                                      │ http://127.0.0.1:18787
                                                      ▼
                                             echobridge-gateway
-                                              ├── 127.0.0.1:18801  ASR worker
+                                              ├── Qwen3-ASR（进程内，同一 CUDA context）
                                               └── 127.0.0.1:18802  TTS worker (vLLM-Omni)
 ```
 
+默认 `ECHOBRIDGE_ASR_BACKEND=inprocess`：ASR 模型直接加载在 gateway 进程内，
+不再需要 18801/`echobridge-asr`。切换回 `qwen3` 时才使用独立的 ASR worker。
+
 | 服务 | 端口 | 启动方式 | 说明 |
 |---|---|---|---|
-| `echobridge-gateway` | 18787 | `python -m echobridge` | WSS、VAD、turn、LLM、pacer |
-| `echobridge-asr` | 18801 | `scripts/asr_worker.sh` | Qwen3-ASR-0.6B，独立 venv |
+| `echobridge-gateway` | 18787 | `python -m echobridge` | WSS、VAD、turn、LLM、pacer、进程内 ASR |
+| `echobridge-asr`（可选回退） | 18801 | `scripts/asr_worker.sh` | Qwen3-ASR-0.6B，独立 venv |
 | `echobridge-tts` | 18802 | `scripts/tts_vllm.sh` | Qwen3-TTS-0.6B，vLLM-Omni |
 | `echobridge-watchdog.timer` | — | `deploy/watchdog.sh` | 每 30 s 检查进程与 worker |
 
@@ -30,8 +33,10 @@ X10A ── wss://work-pc.<tailnet>.ts.net:8443 ── Tailscale Serve（仅 tai
 cat /etc/wsl.conf          # [boot] systemd=true
 ps -p 1 -o comm=           # systemd
 
-# 三个 Python 环境（Phase 1–5 已创建）
-ls ~/.venvs/echobridge ~/.venvs/echobridge-asr ~/.venvs/echobridge-tts-vllm
+# Python 环境：主 venv 现在需要 qwen-asr/qwen-tts（进程内后端）
+ls ~/.venvs/echobridge ~/.venvs/echobridge-tts-vllm
+# 可选的 qwen3 回退环境
+ls ~/.venvs/echobridge-asr
 
 # 模型与音色
 ls ~/.cache/echobridge/models/Qwen3-ASR-0.6B
@@ -58,7 +63,11 @@ bash deploy/install.sh --user --stop-legacy
 - 配置安装到 `~/.config/echobridge/echobridge.env`（600）。
 - 首次安装会复用 `var/dev-token`，**不会更换 X10A 已保存的 token**；并从 `var/llm.env` 导入 LLM key（不打印）。
 - `--stop-legacy` 只停止当前监听 18787/18801/18802 的手工进程；如果 systemd 网关已运行则跳过。
-- 安装后先起 ASR/TTS，再起网关；网关 `ExecStartPre` 最多等 300 s 让模型就绪。
+- `ECHOBRIDGE_ASR_BACKEND=inprocess` 时不会启动 `echobridge-asr`；网关直接加载
+  ASR 模型。`ECHOBRIDGE_TTS_BACKEND=inprocess` 时同样不会启动 `echobridge-tts`。
+  切回 `qwen3`/`vllm` 后重新运行 `deploy/install.sh` 才会启用对应 worker。
+- 安装后按 env 启动 worker（如 vLLM），再起网关；网关 `ExecStartPre` 最多等
+  300 s 让 TTS 就绪。
 
 ### 3.2 原生 Ubuntu（systemd 系统服务）
 
@@ -94,13 +103,19 @@ ECHOBRIDGE_PORT=18787
 ECHOBRIDGE_ENABLE_PROBE=0
 
 ECHOBRIDGE_VAD_BACKEND=silero
-ECHOBRIDGE_ASR_BACKEND=qwen3
+# 默认：ASR 在 gateway 进程内，和 vLLM 共用一张卡但不再多一个 CUDA context。
+ECHOBRIDGE_ASR_BACKEND=inprocess
+ECHOBRIDGE_ASR_MODEL=~/.cache/echobridge/models/Qwen3-ASR-0.6B
+ECHOBRIDGE_ASR_DEVICE=cuda:0
+# 回退到独立 worker 时改成 qwen3 并保留 URL：
+# ECHOBRIDGE_ASR_BACKEND=qwen3
 ECHOBRIDGE_ASR_URL=http://127.0.0.1:18801
 ECHOBRIDGE_TTS_BACKEND=vllm
 ECHOBRIDGE_TTS_URL=http://127.0.0.1:18802
 ECHOBRIDGE_LLM_BACKEND=deepseek
 ECHOBRIDGE_LLM_API_KEY=<只放 env>
-ECHOBRIDGE_TTS_GPU_UTIL=0.40
+# 单会话瘦身：Stage 0 0.30 + Stage 1 0.18；旧值 0.40。
+ECHOBRIDGE_TTS_GPU_UTIL=0.30
 ECHOBRIDGE_TTS_VOICE_DIR=~/.cache/echobridge/voices/mingyue
 # 可选；留空使用 <voice_dir>/voices.json
 ECHOBRIDGE_TTS_VOICE_REGISTRY=
@@ -173,8 +188,9 @@ bash deploy/status.sh --system      # 原生
 
 Watchdog 每 30 s 检查：
 
-- 网关 `/healthz`（连续 3 次失败 → 重启网关）；
-- ASR `/healthz` 的 `ok`；
+- 网关 `/healthz`（连续 3 次失败 → 重启网关）；进程内 ASR 的就绪状态在
+  `/readyz` 的 `workers.asr` 中直接可见；
+- 仅当 `ECHOBRIDGE_ASR_BACKEND=qwen3` 时检查 ASR `/healthz`；
 - TTS `/health`（vLLM）或 `/healthz`（HF）；
 - 冷启动宽限 `ECHOBRIDGE_WATCHDOG_GRACE_S`（默认 300 s）：`Type=simple` 的 worker 刚启动就显示 active，但模型可能还在加载；宽限期内不重启，避免把正在加载的 TTS 反复杀掉；
 - 进程崩溃由 systemd `Restart=always` 兜底；watchdog 只处理“进程在但无响应”。
@@ -190,9 +206,9 @@ systemctl --user start echobridge-watchdog.timer
 日志：
 
 ```bash
-journalctl --user -u echobridge-gateway -f
-journalctl --user -u echobridge-asr -f
+journalctl --user -u echobridge-gateway -f   # 含 inprocess ASR/TTS 日志
 journalctl --user -u echobridge-tts -f
+journalctl --user -u echobridge-asr -f        # 仅 qwen3 回退模式
 journalctl --user -u echobridge-watchdog -n 50
 ```
 
@@ -201,9 +217,12 @@ journalctl --user -u echobridge-watchdog -n 50
 ## 8. 启停与升级
 
 ```bash
-# WSL2
+# WSL2（默认 inprocess：没有 ASR worker）
 systemctl --user restart echobridge-gateway
-systemctl --user stop echobridge-gateway echobridge-asr echobridge-tts
+systemctl --user stop echobridge-gateway echobridge-tts
+systemctl --user start echobridge-tts echobridge-gateway
+
+# qwen3 回退：再加上 echobridge-asr
 systemctl --user start echobridge-asr echobridge-tts echobridge-gateway
 
 # 原生

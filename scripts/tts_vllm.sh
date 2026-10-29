@@ -8,7 +8,7 @@ MODEL="${ECHOBRIDGE_TTS_MODEL:-$HOME/.cache/echobridge/models/Qwen3-TTS-12Hz-0.6
 DEPLOY="${ECHOBRIDGE_TTS_DEPLOY_CONFIG:-$ROOT/deploy/qwen3_tts_echobridge.yaml}"
 HOST="${ECHOBRIDGE_TTS_HOST:-127.0.0.1}"
 PORT="${ECHOBRIDGE_TTS_PORT:-18802}"
-GPU_UTIL="${ECHOBRIDGE_TTS_GPU_UTIL:-0.45}"
+GPU_UTIL="${ECHOBRIDGE_TTS_GPU_UTIL:-0.30}"
 
 if [[ ! -x "$VLLM_OMNI" ]]; then
   echo "vLLM-Omni not found: $VLLM_OMNI" >&2

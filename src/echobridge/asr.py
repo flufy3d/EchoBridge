@@ -7,14 +7,25 @@ and lets the worker stay hot across device sessions.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import inspect
+import os
 import re
+import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 
 from .config import Settings
+from .gpu import (
+    PRIORITY_ASR_FINAL,
+    PRIORITY_ASR_SPECULATIVE,
+    get_gpu_scheduler,
+)
 from .logging import get_logger
 
 logger = get_logger("echobridge.asr")
@@ -87,7 +98,12 @@ class ASRResult:
 
 class ASRBackend(Protocol):
     async def transcribe(
-        self, pcm: bytes, sample_rate: int = 16000, context: str | None = None
+        self,
+        pcm: bytes,
+        sample_rate: int = 16000,
+        context: str | None = None,
+        *,
+        speculative: bool = False,
     ) -> ASRResult: ...
 
     async def warmup(self) -> None: ...
@@ -100,7 +116,12 @@ class MockASR:
         self._text = text.strip()
 
     async def transcribe(
-        self, pcm: bytes, sample_rate: int = 16000, context: str | None = None
+        self,
+        pcm: bytes,
+        sample_rate: int = 16000,
+        context: str | None = None,
+        *,
+        speculative: bool = False,
     ) -> ASRResult:
         return ASRResult(self._text, "zh", 0.0)
 
@@ -122,7 +143,12 @@ class Qwen3ASRClient:
         self._context = context.strip()
 
     async def transcribe(
-        self, pcm: bytes, sample_rate: int = 16000, context: str | None = None
+        self,
+        pcm: bytes,
+        sample_rate: int = 16000,
+        context: str | None = None,
+        *,
+        speculative: bool = False,
     ) -> ASRResult:
         # None keeps the gateway-wide ECHOBRIDGE_ASR_HOTWORDS default; an
         # explicit "" disables it for a session that cleared its hotword list.
@@ -160,7 +186,226 @@ class Qwen3ASRClient:
         await self._client.aclose()
 
 
+class InProcessQwen3ASR:
+    """Qwen3-ASR loaded directly in the gateway process.
+
+    This removes the localhost HTTP round-trip, the PCM body copy and the
+    base64 context header.  Inference still runs in a worker thread so the
+    asyncio loop (WebSocket receive, pacer, VAD) stays responsive; the shared
+    :class:`~echobridge.gpu.GPUScheduler` serialises it against in-process TTS.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._model_path = str(Path(os.path.expanduser(settings.asr_model)))
+        self._language = settings.asr_language or None
+        self._max_new_tokens = max(1, settings.asr_max_new_tokens)
+        self._device = settings.asr_device
+        self._attn = settings.asr_attn_implementation or "sdpa"
+        self._scheduler = get_gpu_scheduler()
+        self._model: Any = None
+        self._supports_context: bool | None = None
+        self._load_error = ""
+        self._load_s = 0.0
+        self._loaded_at = 0.0
+        self._thread_lock = threading.Lock()
+        self._load_lock: asyncio.Lock | None = None
+        self._context_warned = False
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def backend(self) -> str:
+        return "inprocess"
+
+    def _ensure_load_lock(self) -> asyncio.Lock:
+        if self._load_lock is None:
+            self._load_lock = asyncio.Lock()
+        return self._load_lock
+
+    async def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
+        async with self._ensure_load_lock():
+            if self._model is not None:
+                return
+            try:
+                await self._scheduler.run(
+                    "asr-load",
+                    self._load_sync,
+                    priority=PRIORITY_ASR_FINAL,
+                    timeout=None,
+                )
+            except Exception as exc:
+                self._load_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("inprocess asr load failed")
+                raise
+
+    def _load_sync(self) -> None:
+        if self._model is not None:
+            return
+        with self._thread_lock:
+            if self._model is not None:
+                return
+            # Import lazily: mock/energy test runs never touch qwen_asr/torch.
+            import numpy as np
+            import torch
+            from qwen_asr import Qwen3ASRModel
+
+            started = time.perf_counter()
+            kwargs: dict[str, Any] = {}
+            if self._attn:
+                kwargs["attn_implementation"] = self._attn
+            model = Qwen3ASRModel.from_pretrained(
+                self._model_path,
+                dtype=torch.bfloat16,
+                device_map=self._device,
+                max_inference_batch_size=1,
+                max_new_tokens=self._max_new_tokens,
+                **kwargs,
+            )
+            try:
+                self._supports_context = (
+                    "context" in inspect.signature(model.transcribe).parameters
+                )
+            except (TypeError, ValueError):
+                self._supports_context = False
+            if self._settings.asr_compile:
+                try:
+                    model.thinker.model = torch.compile(
+                        model.thinker.model, dynamic=True
+                    )
+                    logger.info("inprocess asr decoder torch.compile enabled")
+                except Exception as exc:
+                    logger.warning("inprocess asr torch.compile failed: %s", exc)
+            # Warm kernels and the audio frontend with silence.  No playback.
+            warm = np.zeros(16000, dtype=np.float32)
+            model.transcribe(audio=(warm, 16000), language=self._language)
+            torch.cuda.synchronize()
+            self._model = model
+            self._loaded_at = time.perf_counter()
+            self._load_s = self._loaded_at - started
+            self._load_error = ""
+            logger.info(
+                "inprocess asr loaded path=%s load_s=%.2f vram_mb=%.1f context=%s",
+                self._model_path,
+                self._load_s,
+                torch.cuda.memory_allocated() / (1024 * 1024),
+                self._supports_context,
+            )
+
+    async def transcribe(
+        self,
+        pcm: bytes,
+        sample_rate: int = 16000,
+        context: str | None = None,
+        *,
+        speculative: bool = False,
+    ) -> ASRResult:
+        if sample_rate != 16000:
+            raise ValueError("only 16 kHz input is supported")
+        if not pcm:
+            return ASRResult("", "", 0.0)
+        await self._ensure_loaded()
+        if self._model is None:
+            raise RuntimeError(self._load_error or "ASR model not loaded")
+        priority = (
+            PRIORITY_ASR_SPECULATIVE if speculative else PRIORITY_ASR_FINAL
+        )
+        effective_context = (context or "").strip()
+        started = time.perf_counter()
+        payload = await self._scheduler.run(
+            "asr-spec" if speculative else "asr",
+            self._infer_sync,
+            pcm,
+            context=effective_context,
+            priority=priority,
+            timeout=self._settings.asr_timeout_s,
+        )
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        logger.info(
+            "asr result chars=%d language=%s infer_ms=%.1f wall_ms=%.1f "
+            "spec=%s context=%s",
+            len(payload["text"]),
+            payload["language"] or "-",
+            payload["latency_ms"],
+            wall_ms,
+            "1" if speculative else "0",
+            "1" if effective_context else "0",
+        )
+        return ASRResult(payload["text"], payload["language"], payload["latency_ms"])
+
+    def _infer_sync(self, pcm: bytes, *, context: str) -> dict[str, Any]:
+        import numpy as np
+        import torch
+
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        kwargs: dict[str, Any] = {}
+        if context and self._supports_context:
+            kwargs["context"] = context
+        elif context and not self._context_warned:
+            logger.warning(
+                "inprocess asr context ignored: installed qwen-asr has no "
+                "context parameter"
+            )
+            self._context_warned = True
+        started = time.perf_counter()
+        results = self._model.transcribe(
+            audio=(audio, 16000),
+            language=self._language,
+            **kwargs,
+        )
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if not results:
+            return {"text": "", "language": "", "latency_ms": elapsed_ms}
+        result = results[0]
+        return {
+            "text": str(getattr(result, "text", "") or "").strip(),
+            "language": str(getattr(result, "language", "") or ""),
+            "latency_ms": elapsed_ms,
+        }
+
+    async def warmup(self) -> None:
+        await self._ensure_loaded()
+
+    def health(self) -> dict[str, object]:
+        memory = self._scheduler.memory() if self._model is not None else None
+        return {
+            "ok": self._model is not None,
+            "backend": "inprocess",
+            "model": self._model_path,
+            "loaded": self._model is not None,
+            "load_s": round(self._load_s, 2),
+            "load_error": self._load_error,
+            "language": self._language or "auto",
+            "max_new_tokens": self._max_new_tokens,
+            "supports_context": self._supports_context,
+            "vram_allocated_mb": round(memory.allocated_mb, 1) if memory else 0.0,
+            "vram_reserved_mb": round(memory.reserved_mb, 1) if memory else 0.0,
+            "device": memory.device if memory else "",
+        }
+
+    async def close(self) -> None:
+        if self._model is None:
+            return
+        self._model = None
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def make_asr(settings: Settings, mock_text: str | None = None) -> ASRBackend:
+    if settings.asr_backend == "inprocess":
+        return InProcessQwen3ASR(settings)
     if settings.asr_backend == "qwen3":
         return Qwen3ASRClient(
             settings.asr_url, settings.asr_timeout_s, settings.asr_context

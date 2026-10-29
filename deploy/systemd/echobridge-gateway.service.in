@@ -1,8 +1,8 @@
 [Unit]
 Description=EchoBridge realtime voice gateway
 Documentation=file://@ROOT@/docs/DEPLOY.md
-After=network-online.target echobridge-asr.service echobridge-tts.service
-Wants=network-online.target echobridge-asr.service echobridge-tts.service
+After=network-online.target @WORKER_UNITS@
+Wants=network-online.target @WORKER_UNITS@
 StartLimitIntervalSec=120
 StartLimitBurst=5
 

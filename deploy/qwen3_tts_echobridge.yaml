@@ -12,8 +12,8 @@
 #   * Stage 0 (talker) sets max_num_batched_tokens=512 for async-chunk
 #     latency tuning (not correctness) — small per-step batches keep
 #     first-chunk latency low, and the MRV2 profiles rely on that bound.
-#   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
-#     codec prefill length (Q * num_frames) exceeds the 32k default.
+#   * Stage 1 (code2wav) sets max_num_batched_tokens=8192: a 72+25 frame
+#     window is 16 * 97 = 1552 tokens, far below the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
 #     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
 #     set true to disable that path in eager mode.
@@ -68,8 +68,11 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 64
-    gpu_memory_utilization: 0.3
+    # EchoBridge is a strict single-device, single-conversation deployment.
+    # 2 leaves room for vLLM's async-chunk handoff without reserving 64
+    # sequences worth of KV cache on an 8 GiB card.
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.30
     trust_remote_code: true
     # Omni prefix cache (reuse of talker codec rows on shared prefixes). Off
     # by default; set true when text repeats across requests (same voice or
@@ -82,7 +85,10 @@ stages:
     # Bound per-step prefill work (validated MRV2 basic profile). Small
     # per-step batches keep first-chunk latency low.
     max_num_batched_tokens: 512
-    max_model_len: 4096
+    # The talker only sees one short sentence (the gateway splits at 15-18
+    # chars) plus its codec prompt.  2048 is ample; 4096 required 0.44 GiB KV
+    # and did not fit at gpu_memory_utilization=0.30 (measured 0.33 GiB free).
+    max_model_len: 2048
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -116,9 +122,10 @@ stages:
   - stage_id: 1
     # Decoder compute dtype on GPU/NPU; 310P requires FP16 and overrides this.
     dtype: bfloat16
-    # Tuned for Base voice clone; CustomVoice / VoiceDesign are TTFA-optimal at 1.
-    max_num_seqs: 64
-    gpu_memory_utilization: 0.3
+    # One conversation = one codec stream.  The codec model is only 0.64 GiB;
+    # 0.18 leaves enough KV for the 72-frame left context + 25-frame chunk.
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.18
     enforce_eager: false
     trust_remote_code: true
     enable_prefix_caching: false
@@ -126,10 +133,13 @@ stages:
     # Must be divisible by num_code_groups and cover (left_context + chunk).
     # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep
     # headroom past 32k.
-    max_num_batched_tokens: 65536
-    # async_chunk appends windows per step; max_model_len must cover the
-    # accumulated flat codec stream.
-    max_model_len: 65536
+    # 16 codebooks * (72 left-context + 25 chunk) = 1552 tokens per window;
+    # 8192 covers that with headroom for several chunks in flight.
+    max_num_batched_tokens: 8192
+    # async_chunk appends windows per step; 8192 covers a ~10 s utterance
+    # (about 125 codec frames * 16) plus left context.  The old 65536
+    # reservation was never exercised by a single EchoBridge session.
+    max_model_len: 8192
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory

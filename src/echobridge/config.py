@@ -65,8 +65,19 @@ class Settings:
     # While a response plays (full duplex) the pre-roll is AEC residual echo,
     # so keep it short.
     vad_playback_pre_roll_ms: int = 300
+    # Long utterances get a shorter pre-roll in the ASR request: their leading
+    # clause is less likely to be a soft onset, and 500 ms less audio saves
+    # roughly 100 ms of encoder/generation time.  Short turns keep the full
+    # pre-roll that protects soft leading words.
+    vad_long_pre_roll_ms: int = 300
+    vad_long_pre_roll_after_ms: int = 2500
     vad_tail_pad_ms: int = 100
     vad_speculative_lead_ms: int = 150
+    # Long utterances spend proportionally longer in ASR.  Start their
+    # speculative pass earlier; short turns keep the safe 150 ms lead so a
+    # natural pause does not launch (and then discard) an expensive ASR run.
+    vad_speculative_long_lead_ms: int = 350
+    vad_speculative_long_after_ms: int = 2500
     vad_start_ms: int = 64
     silero_threshold: float = 0.5
     # Lower threshold used only to *open* a segment while no response is
@@ -91,6 +102,17 @@ class Settings:
     asr_backend: str = "mock"
     asr_url: str = "http://127.0.0.1:18801"
     asr_timeout_s: float = 8.0
+    # In-process Qwen3-ASR (``ECHOBRIDGE_ASR_BACKEND=inprocess``).  The model
+    # lives in the gateway process and shares its CUDA context with an
+    # in-process TTS backend, if one is enabled.
+    asr_model: str = "~/.cache/echobridge/models/Qwen3-ASR-0.6B"
+    asr_language: str = "Chinese"
+    asr_max_new_tokens: int = 192
+    asr_device: str = "cuda:0"
+    asr_attn_implementation: str = "sdpa"
+    # Optional torch.compile for the ASR decoder.  Off by default: the first
+    # call pays a long compilation cost and the gain on a 3070 is modest.
+    asr_compile: bool = False
     mock_asr_text: str = "你好呀，溟月"
     # Qwen3-ASR context biasing.  This is *not* a weighted hotword table: the
     # terms are injected as the request context/system prompt, so keep the list
@@ -100,6 +122,19 @@ class Settings:
     tts_backend: str = "mock"
     tts_url: str = "http://127.0.0.1:18802"
     tts_timeout_s: float = 30.0
+    # In-process Qwen3-TTS (``ECHOBRIDGE_TTS_BACKEND=inprocess``).  The HF
+    # implementation is experimental; vLLM-Omni remains the default when it is
+    # available.  See docs/PHASE7.md for the measured comparison.
+    tts_model: str = "~/.cache/echobridge/models/Qwen3-TTS-12Hz-0.6B-Base"
+    tts_device: str = "cuda:0"
+    tts_language: str = "Chinese"
+    tts_max_new_tokens: int = 512
+    tts_attn_implementation: str = "sdpa"
+    tts_compile: bool = False
+    # Streaming codec chunking, mirroring deploy/qwen3_tts_echobridge.yaml.
+    tts_initial_codec_frames: int = 1
+    tts_codec_chunk_frames: int = 25
+    tts_codec_left_context_frames: int = 72
     tts_voice_id: str = "mingyue_v1"
     # Voice registry.  ``tts_voice_registry`` is optional; when empty the
     # gateway uses ``<tts_voice_dir>/voices.json``.  The legacy ref_audio/
@@ -183,8 +218,18 @@ class Settings:
             vad_max_speech_ms=_env_int("ECHOBRIDGE_VAD_MAX_SPEECH_MS", 15_000),
             vad_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_PRE_ROLL_MS", 800),
             vad_playback_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_PLAYBACK_PRE_ROLL_MS", 300),
+            vad_long_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_LONG_PRE_ROLL_MS", 300),
+            vad_long_pre_roll_after_ms=_env_int(
+                "ECHOBRIDGE_VAD_LONG_PRE_ROLL_AFTER_MS", 2500
+            ),
             vad_tail_pad_ms=_env_int("ECHOBRIDGE_VAD_TAIL_PAD_MS", 100),
             vad_speculative_lead_ms=_env_int("ECHOBRIDGE_VAD_SPECULATIVE_LEAD_MS", 150),
+            vad_speculative_long_lead_ms=_env_int(
+                "ECHOBRIDGE_VAD_SPECULATIVE_LONG_LEAD_MS", 350
+            ),
+            vad_speculative_long_after_ms=_env_int(
+                "ECHOBRIDGE_VAD_SPECULATIVE_LONG_AFTER_MS", 2500
+            ),
             vad_start_ms=_env_int("ECHOBRIDGE_VAD_START_MS", 64),
             silero_threshold=float(os.environ.get("ECHOBRIDGE_SILERO_THRESHOLD", "0.5")),
             silero_start_threshold=float(
@@ -199,11 +244,43 @@ class Settings:
             asr_backend=os.environ.get("ECHOBRIDGE_ASR_BACKEND", "mock").strip().lower(),
             asr_url=os.environ.get("ECHOBRIDGE_ASR_URL", "http://127.0.0.1:18801").rstrip("/"),
             asr_timeout_s=float(os.environ.get("ECHOBRIDGE_ASR_TIMEOUT_S", "8")),
+            asr_model=os.environ.get(
+                "ECHOBRIDGE_ASR_MODEL",
+                "~/.cache/echobridge/models/Qwen3-ASR-0.6B",
+            ),
+            asr_language=os.environ.get("ECHOBRIDGE_ASR_LANGUAGE", "Chinese").strip(),
+            asr_max_new_tokens=_env_int("ECHOBRIDGE_ASR_MAX_NEW_TOKENS", 192),
+            asr_device=os.environ.get("ECHOBRIDGE_ASR_DEVICE", "cuda:0").strip()
+            or "cuda:0",
+            asr_attn_implementation=os.environ.get(
+                "ECHOBRIDGE_ASR_ATTN_IMPLEMENTATION", "sdpa"
+            ).strip()
+            or "sdpa",
+            asr_compile=_env_bool("ECHOBRIDGE_ASR_COMPILE", False),
             mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀，溟月"),
             asr_hotwords=_env_phrases("ECHOBRIDGE_ASR_HOTWORDS", ()),
             tts_backend=os.environ.get("ECHOBRIDGE_TTS_BACKEND", "mock").strip().lower(),
             tts_url=os.environ.get("ECHOBRIDGE_TTS_URL", "http://127.0.0.1:18802").rstrip("/"),
             tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),
+            tts_model=os.environ.get(
+                "ECHOBRIDGE_TTS_MODEL",
+                "~/.cache/echobridge/models/Qwen3-TTS-12Hz-0.6B-Base",
+            ),
+            tts_device=os.environ.get("ECHOBRIDGE_TTS_DEVICE", "cuda:0").strip()
+            or "cuda:0",
+            tts_language=os.environ.get("ECHOBRIDGE_TTS_LANGUAGE", "Chinese").strip()
+            or "Chinese",
+            tts_max_new_tokens=_env_int("ECHOBRIDGE_TTS_MAX_NEW_TOKENS", 512),
+            tts_attn_implementation=os.environ.get(
+                "ECHOBRIDGE_TTS_ATTN_IMPLEMENTATION", "sdpa"
+            ).strip()
+            or "sdpa",
+            tts_compile=_env_bool("ECHOBRIDGE_TTS_COMPILE", False),
+            tts_initial_codec_frames=_env_int("ECHOBRIDGE_TTS_INITIAL_CODEC_FRAMES", 1),
+            tts_codec_chunk_frames=_env_int("ECHOBRIDGE_TTS_CODEC_CHUNK_FRAMES", 25),
+            tts_codec_left_context_frames=_env_int(
+                "ECHOBRIDGE_TTS_CODEC_LEFT_CONTEXT_FRAMES", 72
+            ),
             tts_voice_id=os.environ.get("ECHOBRIDGE_TTS_VOICE_ID", "mingyue_v1").strip()
             or "mingyue_v1",
             tts_voice_dir=os.environ.get(

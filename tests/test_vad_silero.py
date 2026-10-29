@@ -105,6 +105,23 @@ def test_idle_pre_roll_covers_800ms():
     assert tags[0] <= 32 - 24
 
 
+def test_long_utterance_trims_oldest_pre_roll():
+    # 3.2 s of speech: keep the 800 ms VAD pre-roll for detection, but send
+    # only the newest 300 ms to ASR (saves ~500 ms of encoder work).
+    probs = [0.0] * 30 + [0.9] * 100 + [0.0] * 12
+    vad = SileroVAD(
+        silero_settings(vad_long_pre_roll_ms=300, vad_long_pre_roll_after_ms=2500),
+        model=ScriptedModel(probs),
+    )
+    events = push_windows(vad, list(range(1, len(probs) + 1)))
+    final = next(e for e in events if e.kind == "final")
+    assert final.speech_ms >= 2500
+    tags = tags_of(final.pcm)
+    # Start fires around window 32; only ~9 pre-roll windows (300 ms) remain.
+    assert tags[0] >= 20
+    assert tags[-1] >= 120
+
+
 def test_pre_roll_does_not_duplicate_partial_frame():
     # Feed 20 ms frames (640 bytes) so the start window ends mid-frame.
     probs = [0.0] * 3 + [0.9] * 6 + [0.0] * 12
@@ -131,6 +148,22 @@ def test_short_segment_is_carried_into_next_segment():
     # Carried speech counts toward the next segment (the first start window
     # is not counted, as before).
     assert finals[1].speech_ms == finals[0].speech_ms + 9 * 32
+
+
+def test_long_trim_keeps_short_carry():
+    # Short "停" carried into a 3+ s segment; trimming the old pre-roll must
+    # not delete the carried speech at the front.
+    probs = [0.9] * 4 + [0.0] * 10 + [0.0] * 5 + [0.9] * 100 + [0.0] * 12
+    vad = SileroVAD(
+        silero_settings(vad_long_pre_roll_ms=300, vad_long_pre_roll_after_ms=2500),
+        model=ScriptedModel(probs),
+    )
+    events = push_windows(vad, list(range(1, len(probs) + 1)))
+    finals = [e for e in events if e.kind == "final"]
+    assert len(finals) == 2
+    tags = tags_of(finals[1].pcm)
+    assert tags[0] == 1
+    assert tags[3] == 4
 
 
 def test_short_segment_carry_expires():

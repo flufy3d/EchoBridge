@@ -118,6 +118,7 @@ class Session:
         self._speech_buffers: dict[str, str] = {}
         self._spec_task: asyncio.Task | None = None
         self._spec_item = ""
+        self._spec_pcm_bytes = 0
         self._backchannel_task: asyncio.Task[None] | None = None
         self._last_backchannel = ""
         self._backchannel_sent_this_turn = False
@@ -403,12 +404,23 @@ class Session:
         self._full_duplex = bool(self._settings.full_duplex or detected)
         self._input_aec = aec
 
-    async def _transcribe_pcm(self, pcm: bytes):
-        if self._session_asr_context is None:
-            return await self._asr.transcribe(pcm, 16000)
-        return await self._asr.transcribe(
-            pcm, 16000, context=self._session_asr_context
+    async def _transcribe_pcm(self, pcm: bytes, *, speculative: bool = False):
+        # ``speculative`` is an optional extension used by the in-process
+        # backend to prioritise the final request.  Older/custom backends and
+        # test doubles only implement the original three-argument signature.
+        kwargs = (
+            {"context": self._session_asr_context}
+            if self._session_asr_context is not None
+            else {}
         )
+        try:
+            return await self._asr.transcribe(
+                pcm, 16000, speculative=speculative, **kwargs
+            )
+        except TypeError as exc:
+            if "speculative" not in str(exc):
+                raise
+            return await self._asr.transcribe(pcm, 16000, **kwargs)
 
     async def _handle_audio(self, event: dict[str, Any]) -> None:
         if not self._created or self._closed:
@@ -631,9 +643,10 @@ class Session:
         if not event.pcm:
             return
         self._spec_item = event.item_id
+        self._spec_pcm_bytes = len(event.pcm)
 
         async def run() -> Any:
-            return await self._transcribe_pcm(event.pcm)
+            return await self._transcribe_pcm(event.pcm, speculative=True)
 
         task = asyncio.create_task(run(), name=f"spec-asr-{event.item_id}")
         self._spec_task = task
@@ -643,6 +656,7 @@ class Session:
         task = self._spec_task
         self._spec_task = None
         self._spec_item = ""
+        self._spec_pcm_bytes = 0
         if task is not None and not task.done():
             task.cancel()
 
@@ -652,14 +666,30 @@ class Session:
             return None
         self._spec_task = None
         self._spec_item = ""
+        spec_bytes = self._spec_pcm_bytes
+        self._spec_pcm_bytes = 0
+        # The speculative segment is the final segment minus at most the
+        # endpoint lead (150–350 ms) of trailing silence, which the VAD
+        # tail-pad already removes.  Reuse the in-flight result instead of
+        # starting a second, identical GPU inference.  The in-process ASR
+        # scheduler gives the speculative request higher priority than TTS, so
+        # this wait is normally only the tail of the already-running inference.
         try:
-            result = await asyncio.wait_for(task, timeout=1.5)
+            result = await asyncio.wait_for(task, timeout=self._settings.asr_timeout_s)
+        except asyncio.TimeoutError:
+            # Do not leave a second inference in flight behind the final one.
+            task.cancel()
+            return None
         except Exception:
-            if not task.done():
-                task.cancel()
             return None
         if result is None or not (result.text or "").strip():
             return None
+        logger.info(
+            "speculative asr reused item=%s spec_bytes=%d final_bytes=%d",
+            event.item_id,
+            spec_bytes,
+            len(event.pcm),
+        )
         return result
 
     @staticmethod

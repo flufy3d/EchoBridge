@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from . import __version__
 from .asr import make_asr
 from .config import Settings
+from .gpu import get_gpu_scheduler
 from .logging import get_logger
 from .manager import SessionManager
 from .tts import make_tts
@@ -39,22 +40,43 @@ def _rss_mb() -> float:
     return 0.0
 
 
-async def _worker_health(settings: Settings) -> dict[str, dict[str, object]]:
+async def _worker_health(
+    settings: Settings,
+    *,
+    asr: object | None = None,
+    tts: object | None = None,
+) -> dict[str, dict[str, object]]:
     """Probe configured local workers for the readiness endpoint.
 
     The gateway deliberately starts even when a worker is still loading; the
     watchdog uses this endpoint to wait for (or restart) the full pipeline
-    instead of treating a cold model as a dead gateway.
+    instead of treating a cold model as a dead gateway.  In-process backends
+    are reported directly from their loaded state and CUDA allocator counters.
     """
     probes: dict[str, tuple[str, str]] = {}
-    if settings.asr_backend == "qwen3":
+    results: dict[str, dict[str, object]] = {}
+    if settings.asr_backend == "inprocess":
+        health = getattr(asr, "health", None)
+        results["asr"] = (
+            health()
+            if callable(health)
+            else {"ok": False, "backend": "inprocess", "error": "not constructed"}
+        )
+    elif settings.asr_backend == "qwen3":
         probes["asr"] = (settings.asr_url + "/healthz", "ok")
-    if settings.tts_backend == "vllm":
+
+    if settings.tts_backend == "inprocess":
+        health = getattr(tts, "health", None)
+        results["tts"] = (
+            health()
+            if callable(health)
+            else {"ok": False, "backend": "inprocess", "error": "not constructed"}
+        )
+    elif settings.tts_backend == "vllm":
         probes["tts"] = (settings.tts_url + "/health", "status")
     elif settings.tts_backend == "qwen3":
         probes["tts"] = (settings.tts_url + "/healthz", "ok")
 
-    results: dict[str, dict[str, object]] = {}
     if not probes:
         return results
     async with httpx.AsyncClient(timeout=httpx.Timeout(1.5, connect=0.5)) as client:
@@ -149,12 +171,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     manager = SessionManager()
     voice_registry = load_voice_registry(settings)
     shared_vad = make_vad(settings)
-    shared_asr = make_asr(settings) if settings.asr_backend == "qwen3" else None
+    shared_asr = (
+        make_asr(settings)
+        if settings.asr_backend in {"qwen3", "inprocess"}
+        else None
+    )
     # Keep one TTS client for the whole gateway: its cache holds the fixed
     # greeting and the backchannel fillers warmed at startup.  Previously only
     # the HF qwen3 backend was shared; vLLM sessions each rebuilt an empty
     # cache, which made "prewarmed" greetings and backchannels ineffective.
     shared_tts = make_tts(settings, voice_registry)
+
+    def _inprocess_loaded() -> bool:
+        return bool(
+            getattr(shared_asr, "loaded", False)
+            or getattr(shared_tts, "loaded", False)
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -208,14 +240,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
-        workers = await _worker_health(settings)
+        workers = await _worker_health(settings, asr=shared_asr, tts=shared_tts)
         ok = all(bool(item.get("ok")) for item in workers.values())
+        scheduler = get_gpu_scheduler()
         payload = {
             "ok": ok,
             "service": "echobridge-gateway",
             "version": __version__,
             "uptime_s": round(time.monotonic() - _STARTED_AT, 1),
             "workers": workers,
+            # Additive observability for the single-process/CUDA-context mode.
+            # Empty memory until an in-process model actually exists.
+            "gpu": scheduler.status(include_memory=_inprocess_loaded()),
         }
         return JSONResponse(payload, status_code=200 if ok else 503)
 
@@ -239,6 +275,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "# TYPE echobridge_info gauge",
             f'echobridge_info{{version="{__version__}"}} 1',
         ]
+        memory = (
+            get_gpu_scheduler().memory() if _inprocess_loaded() else None
+        )
+        if memory is not None and memory.device:
+            lines.extend(
+                [
+                    "# HELP echobridge_gpu_memory_allocated_bytes "
+                    "CUDA caching-allocator bytes in use by this process.",
+                    "# TYPE echobridge_gpu_memory_allocated_bytes gauge",
+                    f"echobridge_gpu_memory_allocated_bytes "
+                    f"{int(memory.allocated_mb * 1024 * 1024)}",
+                    "# HELP echobridge_gpu_memory_reserved_bytes "
+                    "CUDA caching-allocator bytes reserved by this process.",
+                    "# TYPE echobridge_gpu_memory_reserved_bytes gauge",
+                    f"echobridge_gpu_memory_reserved_bytes "
+                    f"{int(memory.reserved_mb * 1024 * 1024)}",
+                ]
+            )
         return "\n".join(lines) + "\n"
 
     @app.get("/voices")

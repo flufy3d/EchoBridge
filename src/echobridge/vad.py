@@ -165,6 +165,8 @@ class SileroVAD:
         self._playback = False
         self._window = bytearray()
         self._segment = bytearray()
+        self._segment_pre_roll_bytes = 0
+        self._segment_carry_bytes = 0
         self._active = False
         self._speech_ms = 0
         self._silence_ms = 0
@@ -221,6 +223,8 @@ class SileroVAD:
         self._pre_roll.clear()
         self._window.clear()
         self._segment.clear()
+        self._segment_pre_roll_bytes = 0
+        self._segment_carry_bytes = 0
         self._active = False
         self._speech_ms = 0
         self._silence_ms = 0
@@ -316,6 +320,10 @@ class SileroVAD:
                         self._item_id = f"item_{self._item_seq}"
                         self._speech_threshold = start_threshold
                         self._segment = bytearray(self._carry + self._pre_roll_pcm())
+                        self._segment_carry_bytes = len(self._carry)
+                        self._segment_pre_roll_bytes = (
+                            len(self._segment) - self._segment_carry_bytes
+                        )
                         self._speech_ms = self._carry_speech_ms
                         self._silence_ms = 0
                         self._start_gaps = 0
@@ -350,9 +358,18 @@ class SileroVAD:
 
             # Start ASR slightly before the official endpoint, while the user is
             # already silent.  If speech resumes, the session discards it.
+            # Long utterances get a longer lead: their ASR pass is the slowest,
+            # and the extra head start is what brings the post-endpoint final
+            # back into the target range.
+            lead = self._settings.vad_speculative_lead_ms
+            if (
+                self._speech_ms
+                >= self._settings.vad_speculative_long_after_ms
+            ):
+                lead = max(lead, self._settings.vad_speculative_long_lead_ms)
             early_at = max(
                 0,
-                self._settings.vad_endpoint_ms - self._settings.vad_speculative_lead_ms,
+                self._settings.vad_endpoint_ms - lead,
             )
             if (
                 not self._early_sent
@@ -383,6 +400,20 @@ class SileroVAD:
         if trim_ms:
             cut = min(len(pcm), trim_ms * 32)
             pcm = pcm[: len(pcm) - cut]
+        # Long utterances: keep the oldest pre-roll out of the ASR request.
+        # The 800 ms idle pre-roll still protects soft short commands; after
+        # 2.5 s of speech the leading clause is no longer the risky part.
+        long_keep_bytes = max(0, self._settings.vad_long_pre_roll_ms) * 32
+        if (
+            self._speech_ms >= self._settings.vad_long_pre_roll_after_ms
+            and self._segment_pre_roll_bytes > long_keep_bytes
+        ):
+            excess = self._segment_pre_roll_bytes - long_keep_bytes
+            if 0 < excess < len(pcm):
+                # Keep the carry (a short "停" from the previous segment) at
+                # the front; drop only the oldest pre-roll bytes after it.
+                start = self._segment_carry_bytes + excess
+                pcm = pcm[: self._segment_carry_bytes] + pcm[start:]
         return pcm
 
     def _final(self) -> VADEvent:

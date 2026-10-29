@@ -92,6 +92,22 @@ async def test_vllm_cached_uses_default_for_empty_voice(tmp_path):
         await client.close()
 
 
+async def test_vllm_pinned_entry_bypasses_lru_and_http(tmp_path):
+    registry = make_voice_registry(tmp_path)
+    settings = make_settings(
+        tts_backend="vllm",
+        tts_url="http://127.0.0.1:9",
+        tts_voice_dir=str(tmp_path),
+    )
+    client = VLLMTTSClient(settings, registry)
+    try:
+        pcm = b"\x00\x01" * 4800
+        client._backchannel_cache[(registry.default_id, "你好")] = pcm
+        assert await _collect(client, "你好", registry.default_id) == pcm
+    finally:
+        await client.close()
+
+
 async def test_backchannel_clips_are_pinned_without_synthesis(tmp_path):
     registry = make_voice_registry(tmp_path)
     clip_dir = tmp_path / "backchannel" / "mingyue_v1"

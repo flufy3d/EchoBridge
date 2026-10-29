@@ -392,6 +392,14 @@ class VLLMTTSClient:
             return
         voice = self._resolve_voice(voice_id)
         key = (voice, text)
+        # Pinned greeting/backchannel entries must survive the 8-entry reply
+        # LRU.  Checking only ``_cache`` let a long conversation evict the
+        # greeting from the LRU and re-synthesise it on the next connection.
+        pinned = self._backchannel_cache.get(key)
+        if pinned is not None:
+            for offset in range(0, len(pinned), 4800):
+                yield pinned[offset : offset + 4800]
+            return
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)
@@ -500,6 +508,10 @@ def make_tts(
     settings: Settings, registry: VoiceRegistry | None = None
 ) -> TTSBackend:
     registry = registry or load_voice_registry(settings)
+    if settings.tts_backend == "inprocess":
+        from .tts_inprocess import InProcessQwen3TTS
+
+        return InProcessQwen3TTS(settings, registry)
     if settings.tts_backend == "vllm":
         return VLLMTTSClient(settings, registry)
     if settings.tts_backend == "qwen3":

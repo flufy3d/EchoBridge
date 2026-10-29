@@ -1,5 +1,10 @@
 # Phase 6 基准与验收测量
 
+> **Phase 7 后续**：单进程 ASR + 瘦身 vLLM 的显存/延迟复测见
+> [`docs/PHASE7.md`](PHASE7.md)。整卡显存 7473 → 6576 MiB；ASR after endpoint
+> p50 908 ms、p95 1176 ms；正式首音 p95 2474 → 1559 ms。ASR 350–500 ms 目标
+> 受 0.6B 模型本身吞吐限制，未完全达成，PHASE7 给出实测瓶颈与延迟优先配置。
+>
 > 状态：**30/30 轮主机受控基准完成；感知首音达标；正式首音与 ASR final 有明确豁免**。
 > 日期：2026-10-27 22:24–22:30（CET）
 > 范围：真实 Silero VAD + Qwen3-ASR + DeepSeek Flash + Qwen3-TTS（vLLM-Omni），单 WS 会话 30 轮，无播放。
