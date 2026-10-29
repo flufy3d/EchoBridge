@@ -688,6 +688,18 @@ class InProcessQwen3TTS:
         await self._ensure_prompt(voice_id)
         await self._warm_voice(voice_id)
 
+    async def rewarm(self, voice_id: str) -> None:
+        """Force one real synthesis after a worker/model reload."""
+        voice = self._registry.resolve(voice_id)[0].id
+        self._cache.pop((voice, GREETING), None)
+        self._backchannel_cache.pop((voice, GREETING), None)
+        await self._ensure_loaded()
+        await self._ensure_prompt(voice)
+        pcm = await self._prefetch(GREETING, voice)
+        if pcm:
+            self._backchannel_cache[(voice, GREETING)] = pcm
+        self._warmed.add(voice)
+
     def health(self) -> dict[str, object]:
         memory = self._scheduler.memory() if self._model is not None else None
         return {

@@ -158,6 +158,9 @@ class MockTTS:
     async def ensure_warm(self, voice_id: str) -> None:
         return None
 
+    async def rewarm(self, voice_id: str) -> None:
+        return None
+
     async def close(self) -> None:
         return None
 
@@ -277,6 +280,21 @@ class Qwen3TTSClient:
 
     async def ensure_warm(self, voice_id: str) -> None:
         await self._warm_voice(voice_id)
+
+    async def rewarm(self, voice_id: str) -> None:
+        """Force one real synthesis after the worker process restarted.
+
+        The gateway's `_warmed` set and PCM cache survive a worker restart, so
+        `ensure_warm()` would return without touching the new worker.
+        """
+        voice = self._resolve_voice(voice_id)
+        key = (voice, GREETING)
+        self._cache.pop(key, None)
+        self._backchannel_cache.pop(key, None)
+        pcm = await self._fetch(GREETING, voice)
+        if pcm:
+            self._backchannel_cache[key] = pcm
+        self._warmed.add(voice)
 
     async def close(self) -> None:
         tasks = list(self._warm_tasks)
@@ -493,6 +511,21 @@ class VLLMTTSClient:
 
     async def ensure_warm(self, voice_id: str) -> None:
         await self._warm_voice(voice_id)
+
+    async def rewarm(self, voice_id: str) -> None:
+        """Force one real synthesis after the worker process restarted."""
+        voice = self._resolve_voice(voice_id)
+        collected = bytearray()
+        async for chunk in self._stream(GREETING, voice):
+            collected.extend(chunk)
+        pcm = bytes(collected)
+        if pcm:
+            self._backchannel_cache[(voice, GREETING)] = pcm
+            self._cache[(voice, GREETING)] = pcm
+            self._cache.move_to_end((voice, GREETING))
+            while len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
+        self._warmed.add(voice)
 
     async def close(self) -> None:
         tasks = list(self._warm_tasks)

@@ -30,6 +30,9 @@ X10A ── wss://work-pc.<tailnet>.ts.net:8443 ── Tailscale Serve（仅 tai
 | `echobridge-tts` | 18802 | `scripts/tts_vllm.sh` | Qwen3-TTS-0.6B，vLLM-Omni |
 | `echobridge-watchdog.timer` | — | `deploy/watchdog.sh` | 每 30 s 检查进程与 worker |
 
+gateway 还会每 10 s 探测 TTS worker，检测到重启后自动 `rewarm()`（强制一次真实
+合成，绕过网关内的 PCM 缓存）。`ECHOBRIDGE_TTS_RECOVERY_PROBE_S=0` 可关闭。
+
 模型、参考音频、日志、token、API key 全部在仓库外（`~/.cache/echobridge`、`/etc/echobridge` 或 `~/.config/echobridge`），不提交。
 
 ## 2. 前置条件

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import os
 import time
@@ -118,6 +119,60 @@ async def _worker_health(
     return results
 
 
+async def _watch_tts_recovery(settings: Settings, tts: object, manager: SessionManager) -> None:
+    """Re-warm the TTS worker after it restarts.
+
+    The gateway's PCM caches survive a worker restart, and ``ensure_warm()``
+    returns immediately once the voice is marked warm, so a restarted vLLM/TTS
+    process would still pay 2-4 s on the first real request.  Probe the worker
+    and force one synthesis on the down -> up edge.
+    """
+    if settings.tts_backend not in {"vllm", "qwen3"}:
+        return
+    if settings.tts_recovery_probe_s <= 0:
+        return
+    path = "/health" if settings.tts_backend == "vllm" else "/healthz"
+    url = settings.tts_url.rstrip("/") + path
+    healthy = True
+    down_since: float | None = None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(2.0, connect=1.0)) as client:
+        while True:
+            await asyncio.sleep(max(1.0, settings.tts_recovery_probe_s))
+            try:
+                response = await client.get(url)
+                up = response.status_code == 200
+            except Exception:
+                up = False
+            if not up:
+                healthy = False
+                if down_since is None:
+                    down_since = time.monotonic()
+                continue
+            if healthy:
+                continue
+            active = manager.active
+            if active is not None and active.busy:
+                # Do not steal GPU time from an in-flight answer; retry next tick.
+                continue
+            try:
+                rewarm = getattr(tts, "rewarm", None)
+                started = time.perf_counter()
+                if callable(rewarm):
+                    await rewarm(settings.tts_voice_id)
+                else:
+                    await tts.ensure_warm(settings.tts_voice_id)
+                logger.info(
+                    "tts backend recovered after %.1f s; rewarmed voice=%s in %.0f ms",
+                    time.monotonic() - (down_since or time.monotonic()),
+                    settings.tts_voice_id,
+                    (time.perf_counter() - started) * 1000.0,
+                )
+                healthy = True
+                down_since = None
+            except Exception as exc:
+                logger.warning("tts recovery warmup failed: %s", exc)
+
+
 def _extract_token(ws: WebSocket) -> str:
     auth = ws.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -203,12 +258,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await shared_tts.warmup()
             except Exception as exc:
                 logger.warning("TTS warmup failed: %s", exc)
-        yield
-        await manager.close_active("shutdown")
-        if shared_asr is not None:
-            await shared_asr.close()
+        tts_watch = None
         if shared_tts is not None:
-            await shared_tts.close()
+            tts_watch = asyncio.create_task(
+                _watch_tts_recovery(settings, shared_tts, manager),
+                name="tts-recovery-watch",
+            )
+        try:
+            yield
+        finally:
+            if tts_watch is not None:
+                tts_watch.cancel()
+                await asyncio.gather(tts_watch, return_exceptions=True)
+            await manager.close_active("shutdown")
+            if shared_asr is not None:
+                await shared_asr.close()
+            if shared_tts is not None:
+                await shared_tts.close()
 
     app = FastAPI(title="EchoBridge", version=__version__, lifespan=lifespan)
     app.state.settings = settings

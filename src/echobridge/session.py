@@ -164,6 +164,11 @@ class Session:
     def created(self) -> bool:
         return self._created
 
+    @property
+    def busy(self) -> bool:
+        """True while a response is being generated or played."""
+        return self._response_active
+
     async def run(self) -> None:
         try:
             first = await asyncio.wait_for(self._ws.receive_text(), timeout=10.0)

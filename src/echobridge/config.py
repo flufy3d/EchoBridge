@@ -151,6 +151,10 @@ class Settings:
     tts_backend: str = "mock"
     tts_url: str = "http://127.0.0.1:18802"
     tts_timeout_s: float = 30.0
+    # After a TTS worker restart the gateway cache still holds the greeting,
+    # so ensure_warm() would be a no-op.  Probe the worker and force one real
+    # synthesis request on a down -> up edge.  0 disables the watcher.
+    tts_recovery_probe_s: float = 10.0
     # In-process Qwen3-TTS (``ECHOBRIDGE_TTS_BACKEND=inprocess``).  The HF
     # implementation is experimental; vLLM-Omni remains the default when it is
     # available.  See docs/PHASE7.md for the measured comparison.
@@ -313,6 +317,9 @@ class Settings:
             tts_backend=os.environ.get("ECHOBRIDGE_TTS_BACKEND", "mock").strip().lower(),
             tts_url=os.environ.get("ECHOBRIDGE_TTS_URL", "http://127.0.0.1:18802").rstrip("/"),
             tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),
+            tts_recovery_probe_s=float(
+                os.environ.get("ECHOBRIDGE_TTS_RECOVERY_PROBE_S", "10")
+            ),
             tts_model=os.environ.get(
                 "ECHOBRIDGE_TTS_MODEL",
                 "~/.cache/echobridge/models/Qwen3-TTS-12Hz-0.6B-Base",

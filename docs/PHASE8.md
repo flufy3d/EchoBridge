@@ -115,7 +115,21 @@ TTS ready → ASR ready → gateway
 | ASR 热重启 | 约 62 s |
 | 全停冷启动到全部就绪 | 约 172 s |
 
-### 3.4 回退
+### 3.4 TTS worker 恢复后自动预热
+
+`app.py` 每 10 s 探测一次已配置的 TTS worker；检测到 `down → up` 且当前没有
+正在生成的回复时，调用 `rewarm()` 强制发一次真实合成请求。网关里的 PCM 缓存
+和 `_warmed` 标记会跨 worker 重启保留，普通 `ensure_warm()` 会直接返回，所以
+必须强制绕过缓存。
+
+实测重启 TTS（114 s 恢复）：
+
+```text
+tts backend recovered after 110.9 s; rewarmed voice=mingyue_v1 in 782 ms
+first real TTS request: 220 ms first packet (before: ~3.7 s)
+```
+
+### 3.5 回退
 
 ```bash
 cp -p ~/.config/echobridge/backup-20261029/echobridge.env \
