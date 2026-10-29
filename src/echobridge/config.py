@@ -59,11 +59,26 @@ class Settings:
     vad_endpoint_ms: int = 500
     vad_min_speech_ms: int = 200
     vad_max_speech_ms: int = 15_000
-    vad_pre_roll_ms: int = 300
+    # Idle pre-roll must cover a short leading clause ("没什么，") plus the
+    # comma pause that Silero misses on soft VOICE_COMMUNICATION audio.
+    vad_pre_roll_ms: int = 800
+    # While a response plays (full duplex) the pre-roll is AEC residual echo,
+    # so keep it short.
+    vad_playback_pre_roll_ms: int = 300
     vad_tail_pad_ms: int = 100
     vad_speculative_lead_ms: int = 150
     vad_start_ms: int = 64
     silero_threshold: float = 0.5
+    # Lower threshold used only to *open* a segment while no response is
+    # playing; continuation/endpointing keeps silero_threshold.
+    silero_start_threshold: float = 0.35
+    # Sub-threshold windows tolerated inside the start run before it resets.
+    vad_start_gap_windows: int = 1
+    # A segment dropped as too short ("停", then a pause) is prepended to the
+    # next segment if that one starts within this window.
+    vad_short_carry_ms: int = 1000
+    # Debug only: write every final VAD segment (wav + transcript) here.
+    vad_dump_dir: str | None = None
     silero_model: str | None = None
     # Force full-duplex input handling even when session.create does not
     # advertise extension.audio.input.full_duplex.  Used by tests and for
@@ -151,11 +166,18 @@ class Settings:
             vad_endpoint_ms=_env_int("ECHOBRIDGE_VAD_ENDPOINT_MS", 500),
             vad_min_speech_ms=_env_int("ECHOBRIDGE_VAD_MIN_SPEECH_MS", 200),
             vad_max_speech_ms=_env_int("ECHOBRIDGE_VAD_MAX_SPEECH_MS", 15_000),
-            vad_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_PRE_ROLL_MS", 300),
+            vad_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_PRE_ROLL_MS", 800),
+            vad_playback_pre_roll_ms=_env_int("ECHOBRIDGE_VAD_PLAYBACK_PRE_ROLL_MS", 300),
             vad_tail_pad_ms=_env_int("ECHOBRIDGE_VAD_TAIL_PAD_MS", 100),
             vad_speculative_lead_ms=_env_int("ECHOBRIDGE_VAD_SPECULATIVE_LEAD_MS", 150),
             vad_start_ms=_env_int("ECHOBRIDGE_VAD_START_MS", 64),
             silero_threshold=float(os.environ.get("ECHOBRIDGE_SILERO_THRESHOLD", "0.5")),
+            silero_start_threshold=float(
+                os.environ.get("ECHOBRIDGE_SILERO_START_THRESHOLD", "0.35")
+            ),
+            vad_start_gap_windows=_env_int("ECHOBRIDGE_VAD_START_GAP_WINDOWS", 1),
+            vad_short_carry_ms=_env_int("ECHOBRIDGE_VAD_SHORT_CARRY_MS", 1000),
+            vad_dump_dir=os.environ.get("ECHOBRIDGE_VAD_DUMP_DIR") or None,
             silero_model=os.environ.get("ECHOBRIDGE_SILERO_MODEL") or None,
             full_duplex=_env_bool("ECHOBRIDGE_FULL_DUPLEX", False),
             asr_backend=os.environ.get("ECHOBRIDGE_ASR_BACKEND", "mock").strip().lower(),

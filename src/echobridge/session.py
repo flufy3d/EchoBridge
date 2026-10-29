@@ -18,6 +18,8 @@ import json
 import random
 import time
 import uuid
+import wave
+from pathlib import Path
 from typing import Any, Protocol
 
 from . import protocol
@@ -428,6 +430,9 @@ class Session:
             return
         if not pcm:
             return
+        # Idle: low start threshold + long pre-roll.  Playing: AEC residual,
+        # so stricter start and short pre-roll.
+        self._vad.set_playback(self._response_active)
         for vad_event in self._vad.push(pcm):
             await self._handle_vad_event(vad_event)
 
@@ -474,6 +479,7 @@ class Session:
                     return
             asr_wall_ms = (time.perf_counter() - asr_started) * 1000.0
             text = (result.text or "").strip()
+            self._dump_segment(event, text)
             if not text:
                 await self._send(protocol.asr_failed(event.item_id, "empty speech"))
                 return
@@ -509,14 +515,15 @@ class Session:
                     "stop command item=%s chars=%d", event.item_id, len(text)
                 )
                 if self._response_active:
+                    reset_vad = not self._full_duplex
                     await self._cancel_active(
-                        send_canceled=True, reason="barge_in", reset_vad=True
+                        send_canceled=True, reason="barge_in", reset_vad=reset_vad
                     )
                     self._log_barge_in(
                         barge_ctx,
                         speech_ms=event.speech_ms,
                         asr_ms=asr_wall_ms,
-                        reset_vad=True,
+                        reset_vad=reset_vad,
                         app_canceled=False,
                     )
                     return
@@ -534,14 +541,17 @@ class Session:
                 self._finish_response(ctx)
                 return
             if self._response_active:
+                # Full duplex: the user may still be talking while ASR ran;
+                # a reset here would drop that audio (seen as reset_vad=1).
+                reset_vad = not self._full_duplex
                 await self._cancel_active(
-                    send_canceled=True, reason="barge_in", reset_vad=True
+                    send_canceled=True, reason="barge_in", reset_vad=reset_vad
                 )
                 self._log_barge_in(
                     barge_ctx,
                     speech_ms=event.speech_ms,
                     asr_ms=asr_wall_ms,
-                    reset_vad=True,
+                    reset_vad=reset_vad,
                     app_canceled=False,
                 )
             elif app_canceled:
@@ -553,6 +563,29 @@ class Session:
                     app_canceled=True,
                 )
             await self._start_turn(text)
+
+    def _dump_segment(self, event: VADEvent, text: str) -> None:
+        """Debug only (ECHOBRIDGE_VAD_DUMP_DIR): keep the exact ASR input."""
+        if not self._settings.vad_dump_dir:
+            return
+        try:
+            base = Path(self._settings.vad_dump_dir).expanduser()
+            base.mkdir(parents=True, exist_ok=True)
+            stem = base / (
+                f"{time.strftime('%Y%m%d-%H%M%S')}_{self.session_id}_{event.item_id}"
+            )
+            with wave.open(str(stem.with_suffix(".wav")), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(event.pcm)
+            stem.with_suffix(".txt").write_text(
+                f"{text}\nspeech_ms={event.speech_ms} "
+                f"response_active={int(self._response_active)}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.exception("vad dump failed item=%s", event.item_id)
 
     def _log_barge_in(
         self,
