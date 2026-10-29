@@ -63,7 +63,21 @@ after:  gap p50 0–16 ms, max 62 ms
 1200 ms 音频，出现 0.2–0.9 s 卡顿；`[2,4,8,12,25]` 没有这个断崖。in-process
 TTS 同步支持 `ECHOBRIDGE_TTS_CODEC_CHUNK_RAMP`。
 
-### 2.4 pacer 不再逐块补零
+### 2.4 TTS talker 的 KV 也固定
+
+`deploy/qwen3_tts_echobridge.yaml` 的 stage 0 增加：
+
+```yaml
+kv_cache_memory_bytes: 268435456
+```
+
+启动日志变为 `GPU KV cache size: 2,336 tokens`，不再依赖 WSL2 的 free 差值
+profiling。stage 1（Code2Wav）日志明确 `model without KVCache`，保持自动即可。
+
+实测 104 字长句仍能正常合成（18.96 s 音频，6.36 s），首包/断音指标不变；
+整卡显存约 6611 MiB，比自动 sizing 时还低约 80 MiB。
+
+### 2.5 pacer 不再逐块补零
 
 `AudioPacer` 现在把每次 HTTP 读的不足一帧的尾巴留到下一块拼接，只在响应结束时
 补零。旧实现每 2 s 会插入约 15–20 ms 静音，听感是咔哒声。

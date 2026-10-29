@@ -76,6 +76,12 @@ stages:
     # 2 leaves room for vLLM's async-chunk handoff without reserving 64
     # sequences worth of KV cache on an 8 GiB card.
     max_num_seqs: 2
+    # Fix the talker KV budget instead of letting vLLM infer it from WSL2's
+    # per-process free-memory reading.  Automatic profiling currently gives
+    # ~0.33 GiB (including ~0.09 GiB reserved for CUDA graphs); 256 MiB holds
+    # a full short-sentence request with room for one concurrent clause.
+    # Stage 1 (Code2Wav) is attention-free and keeps automatic sizing.
+    kv_cache_memory_bytes: 268435456
     gpu_memory_utilization: 0.30
     trust_remote_code: true
     # Omni prefix cache (reuse of talker codec rows on shared prefixes). Off
