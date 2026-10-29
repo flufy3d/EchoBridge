@@ -79,6 +79,9 @@ class Settings:
     vad_short_carry_ms: int = 1000
     # Debug only: write every final VAD segment (wav + transcript) here.
     vad_dump_dir: str | None = None
+    # Debug: log mic level / max Silero probability once per second whenever
+    # either is above the noise floor.
+    vad_trace: bool = False
     silero_model: str | None = None
     # Force full-duplex input handling even when session.create does not
     # advertise extension.audio.input.full_duplex.  Used by tests and for
@@ -190,6 +193,7 @@ class Settings:
             vad_start_gap_windows=_env_int("ECHOBRIDGE_VAD_START_GAP_WINDOWS", 1),
             vad_short_carry_ms=_env_int("ECHOBRIDGE_VAD_SHORT_CARRY_MS", 1000),
             vad_dump_dir=os.environ.get("ECHOBRIDGE_VAD_DUMP_DIR") or None,
+            vad_trace=_env_bool("ECHOBRIDGE_VAD_TRACE", False),
             silero_model=os.environ.get("ECHOBRIDGE_SILERO_MODEL") or None,
             full_duplex=_env_bool("ECHOBRIDGE_FULL_DUPLEX", False),
             asr_backend=os.environ.get("ECHOBRIDGE_ASR_BACKEND", "mock").strip().lower(),

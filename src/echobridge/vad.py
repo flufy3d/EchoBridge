@@ -16,6 +16,9 @@ from typing import Literal, Protocol
 
 from .audio import rms_pcm16
 from .config import Settings
+from .logging import get_logger
+
+logger = get_logger("echobridge.vad")
 
 
 @dataclass(slots=True)
@@ -174,6 +177,11 @@ class SileroVAD:
         self._item_seq = 0
         self._item_id = ""
         self._early_sent = False
+        self._trace_ms = 0
+        self._trace_rms_max = 0
+        self._trace_rms_sum = 0
+        self._trace_prob_max = 0.0
+        self._trace_windows = 0
         # Too-short segment kept for the next one (see vad_short_carry_ms).
         self._carry = b""
         self._carry_speech_ms = 0
@@ -243,6 +251,32 @@ class SileroVAD:
         keep = pre_roll_ms * 32
         return pcm[-keep:] if len(pcm) > keep else pcm
 
+    def _trace(self, window: bytes, probability: float) -> None:
+        rms = int(rms_pcm16(window))
+        self._trace_windows += 1
+        self._trace_rms_sum += rms
+        self._trace_rms_max = max(self._trace_rms_max, rms)
+        self._trace_prob_max = max(self._trace_prob_max, probability)
+        self._trace_ms += self._WINDOW_MS
+        if self._trace_ms < 1000:
+            return
+        if self._trace_prob_max >= 0.1 or self._trace_rms_max >= 150:
+            logger.info(
+                "vad trace rms_avg=%d rms_max=%d prob_max=%.2f active=%d playback=%d "
+                "start_windows=%d",
+                self._trace_rms_sum // max(1, self._trace_windows),
+                self._trace_rms_max,
+                self._trace_prob_max,
+                int(self._active),
+                int(self._playback),
+                self._start_windows,
+            )
+        self._trace_ms = 0
+        self._trace_rms_max = 0
+        self._trace_rms_sum = 0
+        self._trace_prob_max = 0.0
+        self._trace_windows = 0
+
     def _probability(self, window: bytes) -> float:
         samples = self._np.frombuffer(window, dtype=self._np.int16).astype(self._np.float32)
         samples /= 32768.0
@@ -265,6 +299,8 @@ class SileroVAD:
             window = bytes(self._window[: self._WINDOW_BYTES])
             del self._window[: self._WINDOW_BYTES]
             probability = self._probability(window)
+            if self._settings.vad_trace:
+                self._trace(window, probability)
             started_now = False
 
             if not self._active:
