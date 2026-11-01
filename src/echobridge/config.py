@@ -68,7 +68,8 @@ def build_asr_context(hotwords: tuple[str, ...] | list[str]) -> str:
     if not terms:
         return ""
     # A Chinese prefix and separators bias Chinese term spellings far better
-    # than "Technical terms: ..." (verified with 溟月 at 8 dB SNR).
+    # than "Technical terms: ..." (verified with a Chinese proper noun at
+    # 8 dB SNR).
     return "专有名词：" + "、".join(terms)
 
 
@@ -142,7 +143,7 @@ class Settings:
     # Optional torch.compile for the ASR decoder.  Off by default: the first
     # call pays a long compilation cost and the gain on a 3070 is modest.
     asr_compile: bool = False
-    mock_asr_text: str = "你好呀，溟月"
+    mock_asr_text: str = "你好呀"
     # Qwen3-ASR context biasing.  This is *not* a weighted hotword table: the
     # terms are injected as the request context/system prompt, so keep the list
     # short and verify with real recordings.
@@ -239,6 +240,11 @@ class Settings:
     # ``<tts_voice_dir>/backchannel``.
     backchannel_clip_dir: str = ""
 
+    # Dev-only prompt audit.  When set, every session.create writes the exact
+    # system prompt sent to the LLM to ``<dir>/<session_id>.txt``.  Empty
+    # disables it; the persona itself is never stored by the gateway.
+    prompt_dump_dir: str = ""
+
     # Dev-only probe page (static HTML; no secrets).
     enable_probe: bool = True
     log_level: str = "INFO"
@@ -320,7 +326,7 @@ class Settings:
             ).strip()
             or "sdpa",
             asr_compile=_env_bool("ECHOBRIDGE_ASR_COMPILE", False),
-            mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀，溟月"),
+            mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀"),
             asr_hotwords=_env_phrases("ECHOBRIDGE_ASR_HOTWORDS", ()),
             tts_backend=os.environ.get("ECHOBRIDGE_TTS_BACKEND", "mock").strip().lower(),
             tts_url=os.environ.get("ECHOBRIDGE_TTS_URL", "http://127.0.0.1:18802").rstrip("/"),
@@ -408,6 +414,7 @@ class Settings:
             backchannel_clip_dir=os.environ.get(
                 "ECHOBRIDGE_BACKCHANNEL_CLIP_DIR", ""
             ).strip(),
+            prompt_dump_dir=os.environ.get("ECHOBRIDGE_PROMPT_DUMP_DIR", "").strip(),
             enable_probe=_env_bool("ECHOBRIDGE_ENABLE_PROBE", True),
             log_level=os.environ.get("ECHOBRIDGE_LOG_LEVEL", "INFO").upper(),
         )

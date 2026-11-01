@@ -28,7 +28,7 @@ DEFAULT_MODEL = str(
     / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 )
 DEFAULT_DIR = Path.home() / ".cache" / "echobridge" / "voices" / "mingyue"
-DEFAULT_TEXT = "你好呀，我是溟月。今天也想陪你聊聊天，可以吗？"
+DEFAULT_TEXT = "你好呀。今天也想陪你聊聊天，可以吗？"
 DEFAULT_INSTRUCT = (
     "年轻女性，二次元可爱声线，明亮、软糯、略带俏皮，语速中等偏快，"
     "句尾轻微上扬；自然清晰，不要过度夹子音/萝莉音，不要播音腔。"

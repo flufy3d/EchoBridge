@@ -34,6 +34,7 @@ async def start_session(
     asr=None,
     tts=None,
     llm=None,
+    instructions: str = "",
 ) -> tuple[FakeWebSocket, Session, asyncio.Task[None]]:
     ws = FakeWebSocket()
     session = Session(
@@ -54,6 +55,7 @@ async def start_session(
             include_voice=include_voice,
             full_duplex=full_duplex,
             aec=aec,
+            instructions=instructions,
         )
     )
     await ws.wait_for_type("session.created")

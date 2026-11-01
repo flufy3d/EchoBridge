@@ -26,9 +26,10 @@ from . import protocol
 from .asr import ASRBackend, MockASR, is_hotword_echo, parse_hotwords
 from .config import Settings, build_asr_context
 from .llm import MockLLM
-from .llm_deepseek import DeepSeekLLM, build_system_prompt
+from .llm_deepseek import DeepSeekLLM
 from .logging import get_logger
 from .pacer import AudioPacer
+from .prompts import build_system_prompt, instructions_fingerprint
 from .speculative import SpeculativeLLM
 from .text import clean_for_tts, is_stop_command, pop_tts_chunk, split_for_tts
 from .tools import available_tool_names, convert_tools
@@ -278,6 +279,24 @@ class Session:
             self._vad.reset()
             self._barge_in_ctx = None
 
+    def _dump_system_prompt(self, prompt: str) -> None:
+        """Write the exact LLM system prompt for one session (opt-in).
+
+        ``ECHOBRIDGE_PROMPT_DUMP_DIR`` is a diagnostic switch, off by default:
+        the prompt can contain the user's private persona.
+        """
+        directory = self._settings.prompt_dump_dir
+        if not directory:
+            return
+        try:
+            root = Path(directory).expanduser()
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / f"{self._session_id}.txt"
+            path.write_text(prompt, encoding="utf-8")
+            logger.info("system prompt dumped path=%s chars=%d", path, len(prompt))
+        except OSError as exc:
+            logger.warning("system prompt dump failed: %s", exc)
+
     async def _handle_session_create(self, event: dict[str, Any]) -> None:
         if self._created:
             logger.debug("duplicate session.create ignored")
@@ -288,7 +307,28 @@ class Session:
             await self.close("protocol")
             return
         self._model = str(session.get("model") or "unknown")
-        self._instructions = str(session.get("instructions") or "")
+        raw_instructions = session.get("instructions")
+        if isinstance(raw_instructions, str):
+            self._instructions = raw_instructions
+        else:
+            # Doubao defines instructions as a string.  An unexpected shape
+            # must never turn into a Python repr in the prompt; treat it as
+            # empty and use the neutral fallback instead.
+            if raw_instructions is not None:
+                logger.warning(
+                    "session instructions has unexpected type=%s; using neutral",
+                    type(raw_instructions).__name__,
+                )
+            self._instructions = ""
+        chars, raw_bytes, digest = instructions_fingerprint(self._instructions)
+        logger.info(
+            "session instructions chars=%d bytes=%d sha256=%s empty=%s",
+            chars,
+            raw_bytes,
+            digest,
+            "1" if not self._instructions.strip() else "0",
+        )
+        self._dump_system_prompt(build_system_prompt(self._instructions))
         raw_voice: str | None = None
         audio = session.get("audio")
         if isinstance(audio, dict):

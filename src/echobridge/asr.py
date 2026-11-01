@@ -67,8 +67,8 @@ def is_hotword_echo(text: str, hotwords: tuple[str, ...]) -> bool:
     On noise or very short audio it often answers with *part* of the configured
     term list (typically the Chinese terms, in prompt order) rather than a
     transcript.  Requiring the whole list -- or an exact match for every term,
-    since ASR can mangle one (溟月 -> 淏月) -- misses that case, so treat a
-    result that is 3+ hotwords and almost nothing else as an echo.
+    since ASR can mangle one -- misses that case, so treat a result that is 3+
+    hotwords and almost nothing else as an echo.
     """
     terms = tuple(term.strip() for term in hotwords if term.strip())
     if len(terms) < 3:
@@ -87,7 +87,7 @@ def is_hotword_echo(text: str, hotwords: tuple[str, ...]) -> bool:
     for prefix in _ECHO_PREFIXES:
         remainder = remainder.replace(prefix, "")
     # Leftover budget covers punctuation plus one short misrecognized term;
-    # "豆包，小鲸鱼，大肥鱼，你们好" keeps three characters and is real speech.
+    # "甲，乙，丙，你们好" keeps three characters and is real speech.
     return len(remainder) <= 2
 
 

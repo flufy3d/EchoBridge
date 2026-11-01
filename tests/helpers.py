@@ -109,6 +109,7 @@ def session_create(
     include_voice: bool = True,
     full_duplex: bool | None = None,
     aec: str | None = None,
+    instructions: str = "",
 ) -> dict:
     output = {
         "format": {"type": "pcm_s16le", "rate": 24000},
@@ -132,7 +133,7 @@ def session_create(
         "event_id": "event_create",
         "session": {
             "model": "1.2.6.1",
-            "instructions": "",
+            "instructions": instructions,
             "audio": {
                 "input": {"format": {"type": "pcm", "rate": 16000}},
                 "output": output,

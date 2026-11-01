@@ -44,6 +44,10 @@ the pipeline.
   (first packet p50 300–357 ms, RTF <0.5 on the reference 3070). An experimental
   `inprocess` backend with streaming Code2Wav and GPU-resident clone prompts is
   included for stronger GPUs or future kernel work.
+- **Client-owned persona** — `session.create.instructions` is the only persona
+  source and is forwarded verbatim (no truncation, caching, or server-side
+  character prompt). Only persona-neutral voice/output rules are appended; an
+  empty instruction string gets a neutral “你是一个语音助手。” prompt.
 - **Voice cloning and custom characters** — a voice registry keeps reference
   audio, text, and clone prompts outside the repository.
 - **Pluggable LLM providers** — DeepSeek, GLM, and any OpenAI-compatible API.
@@ -178,6 +182,7 @@ template.
 | `ECHOBRIDGE_VAD_SPECULATIVE_LONG_LEAD_MS` | `350` | Long-utterance ASR head start |
 | `ECHOBRIDGE_LLM_BACKEND` | `deepseek` | `deepseek` \| `mock` |
 | `ECHOBRIDGE_LLM_API_KEY` | — | Keep in the env file, never in git |
+| `ECHOBRIDGE_PROMPT_DUMP_DIR` | — | Diagnostic only: dump each exact LLM system prompt |
 | `ECHOBRIDGE_BACKCHANNEL_ENABLED` | `1` | Cached filler before the formal reply |
 
 The full WebSocket protocol and event compatibility guarantees are documented in

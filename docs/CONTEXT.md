@@ -14,7 +14,7 @@
 | 生命周期 | 每次 WSS 连接 + `session.create` 新建 `Session` |
 | 写入内容 | user ASR 文本、assistant 最终文本、assistant `tool_calls`、`role=tool` 结果 |
 | 不写入 | greeting、`reasoning_content`、音频、base64 |
-| 请求结构 | `system`（`session.create.instructions` + 实时语音约束）+ `_history` |
+| 请求结构 | `system`（`session.create.instructions` 原样，人格唯一来源 + 非人格语音/输出规则）+ `_history` |
 | 上限 | 最近 60 条消息，按条数截断 |
 | 压缩 | 无。超过 60 条直接丢最旧消息 |
 | 持久化 | 无。重连、休眠恢复、网关重启都会清空 |
@@ -156,7 +156,7 @@
 推荐顺序：
 
 ```text
-[system: 基础 instructions + 实时语音约束]
+[system: 客户端 instructions 原样（人格唯一来源）+ 非人格语音/输出规则]
 [system: 长期记忆摘要 + 用户画像（标注可能过时）]
 [history: 最近 N 轮原文]
 [user: 当前输入]

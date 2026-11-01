@@ -40,7 +40,7 @@
 <input id="token" type="password" autocomplete="off">
 
 <label for="asr">Mock ASR 文本（重连后生效）</label>
-<input id="asr" value="你好呀，溟月" autocomplete="off">
+<input id="asr" value="你好呀" autocomplete="off">
 
 <div class="row">
   <button id="connect">连接</button>
@@ -98,7 +98,7 @@
 
   function asrFromQuery() {
     var match = (location.search || '').match(/[?&]asr_text=([^&]*)/);
-    return match ? decodeURIComponent(match[1]) : '你好呀，溟月';
+    return match ? decodeURIComponent(match[1]) : '你好呀';
   }
 
   function ensureAudio() {
@@ -213,7 +213,7 @@
     var url = $('url').value.trim() || defaultWsUrl();
     var separator = url.indexOf('?') >= 0 ? '&' : '?';
     url = url + separator + 'device_id=probe&asr_text=' +
-          encodeURIComponent($('asr').value.trim() || '你好呀，溟月');
+          encodeURIComponent($('asr').value.trim() || '你好呀');
     var protocols = ['echobridge'];
     if (token) protocols.push('token.' + token);
     log('connecting ' + url, 'dim');

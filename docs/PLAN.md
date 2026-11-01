@@ -469,16 +469,17 @@ TOOL_WAIT
 
 ### 8.2 主对话 prompt
 
-以 `session.create.instructions` 为底，追加“实时语音”约束，并声明优先于原文字数限制：
+人格只由客户端 `session.create.instructions` 决定：网关原样转发、不截断、不缓存、不拼接任何角色设定；只有 instructions 为空时才用中性最小提示词“你是一个语音助手。”。服务端只追加与人格无关的语音/输出规则，并声明优先于原文字数限制：
 
 ```text
-【实时语音约束（优先于上文字数限制）】
+【实时语音与输出规则（与人格无关）】
 1. 每次回复 1–2 句，口语化，不超过 60 个汉字。
 2. 不要 Markdown、列表、标题、代码块、括号动作、表情符号、舞台说明。
 3. 不要提“专家/工具/照片/API/模型”；不要解释推理过程。
 4. 需要看用户眼前画面时调用 look_and_ask；不要猜。
 5. 不要调用 ask_expert（该工具在本后端不可用）；复杂问题直接简短回答或说明。
 6. 句末要顺口，避免长串数字、英文缩写和生僻符号。
+7. 回答涉及自身身体、外貌或穿着的问题时，以人格设定中的描述为准；设定里写了鞋、袜、衣物等穿戴，就按有相应的身体部位来回答，不要用现实物种的常识否认设定。
 ```
 
 - 工具描述沿用 App 的火山格式转换；不重写工具语义。
@@ -511,7 +512,7 @@ TOOL_WAIT
 
 - `Session._history` 只存在于网关进程内存；每次新的 WSS 连接 + `session.create` 创建新 `Session`，历史从空开始。重连、休眠恢复、网关重启都不继承历史。
 - 每轮写入历史的内容：user ASR 文本、assistant 最终文本、assistant `tool_calls`、`role=tool` 工具结果。greeting 和 `reasoning_content` 不写入。
-- 请求消息 = `system`（`session.create.instructions` + 实时语音约束）+ `_history`。
+- 请求消息 = `system`（`session.create.instructions` 原样 + 非人格语音/输出规则）+ `_history`。
 - `_trim_history()` 在每次写入后执行：最多保留最近 60 条；超出时从头部整条丢弃；若头部是 `role=tool`，继续丢弃，保证 tool 链不从中间开始。
 - 纯聊天约 30 轮后开始遗忘最早内容；带工具调用时每轮约 4 条，约 15 轮开始遗忘。
 - 当前没有 token 计数、摘要压缩、向量检索或落盘；设备端 SQLite 只做记录，不回传网关作为上下文。
@@ -686,7 +687,7 @@ voice.echobridge.localVoiceId = mingyue_v1
 
 - DeepSeek Flash 流式；OpenAI tools；过滤 ask_expert；tool_call → App → tool result → 继续。
 - reasoning_content 过滤；首 token/总超时；429 重试；空 content 不送 TTS。
-- 主对话 prompt 追加实时语音约束。
+- 主对话 prompt 原样使用客户端 instructions，只追加非人格语音/输出规则。
 - 30 轮：普通聊天、工具、视觉问答、打断、工具失败、空 ASR。
 - 退出标准：30 轮无状态错乱；首音 p50/p95 达标或记录；工具多调用正确。
 - 提交：`phase 4: DeepSeek streaming + tools`。

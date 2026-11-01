@@ -22,7 +22,7 @@
   - App 回 `conversation.item.create` 后，把 assistant(tool_calls) + role=tool 加入上下文，再发下一次 LLM；新 response 使用新 `response_id`。
   - 多工具调用一次 `items[]` 下发；App 合并回传；测试覆盖 2 个工具。
   - 25 s 工具超时 → `response.canceled`，清理 App pending。
-- 主 prompt：以 `session.create.instructions` 为底，追加“实时语音约束”：1–2 句、≤60 字、口语化、无 Markdown/列表/括号动作、不提专家/工具/照片、需要看画面时调用 `look_and_ask`、不要 `ask_expert`。
+- 主 prompt：`session.create.instructions` 原样作为唯一人格来源（不截断、不缓存、不拼接角色设定），只追加与人格无关的“实时语音与输出规则”。
 - 会话状态：
   - `_run_deepseek_turn` 最多 3 个 tool hop。
   - 文本先流式送 App + TTS，音频结束后 `text.done`，最后 `response.done`。

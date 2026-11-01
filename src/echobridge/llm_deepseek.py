@@ -17,19 +17,6 @@ from .protocol import ToolCall
 
 logger = get_logger("echobridge.deepseek")
 
-REALTIME_VOICE_PROMPT = """【实时语音约束（优先于上文字数限制）】
-1. 每次回复 1–2 句，口语化，不超过 60 个汉字。
-2. 不要 Markdown、列表、标题、代码块、括号动作、表情符号、舞台说明。
-3. 不要提“专家/工具/照片/API/模型”；不要解释推理过程。
-4. 需要看用户眼前画面时调用 look_and_ask；不要猜。
-5. 不要调用 ask_expert（该工具在本后端不可用）；复杂问题直接简短回答或说明。
-6. 句末要顺口，避免长串数字、英文缩写和生僻符号。"""
-
-
-def build_system_prompt(instructions: str) -> str:
-    base = (instructions or "").strip()
-    return f"{base}\n\n{REALTIME_VOICE_PROMPT}" if base else REALTIME_VOICE_PROMPT
-
 
 class DeepSeekLLM:
     def __init__(self, settings: Settings) -> None:
