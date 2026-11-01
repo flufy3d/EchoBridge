@@ -119,6 +119,7 @@ class InProcessQwen3TTS:
         self._thread_lock = threading.Lock()
         self._cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
         self._cache_max = 8
+        self.last_synthesis_at = 0.0
         self._backchannel_cache: dict[tuple[str, str], bytes] = (
             load_backchannel_clips(settings, self._registry)
         )
@@ -549,6 +550,7 @@ class InProcessQwen3TTS:
                 yield chunk
             return
 
+        self.last_synthesis_at = time.monotonic()
         await self._ensure_loaded()
         await self._ensure_prompt(voice)
         state = await self._scheduler.run(

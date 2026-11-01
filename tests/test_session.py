@@ -32,6 +32,8 @@ async def start_session(
     full_duplex: bool | None = None,
     aec: str | None = None,
     asr=None,
+    tts=None,
+    llm=None,
 ) -> tuple[FakeWebSocket, Session, asyncio.Task[None]]:
     ws = FakeWebSocket()
     session = Session(
@@ -41,6 +43,8 @@ async def start_session(
         mock_asr_text=mock_asr_text,
         voice_registry=voice_registry,
         asr=asr,
+        tts=tts,
+        llm=llm,
     )
     task = asyncio.create_task(session.run())
     await ws.push(

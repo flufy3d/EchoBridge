@@ -32,7 +32,7 @@ from .pacer import AudioPacer
 from .speculative import SpeculativeLLM
 from .text import clean_for_tts, is_stop_command, pop_tts_chunk, split_for_tts
 from .tools import available_tool_names, convert_tools
-from .tts import TTSBackend
+from .tts import TTSBackend, TtsUnavailableError
 from .vad import VADBackend, VADEvent, make_vad
 from .voices import VoiceRegistry, load_voice_registry
 
@@ -526,7 +526,11 @@ class Session:
                     logger.exception(
                         "asr failed item=%s bytes=%d", event.item_id, len(event.pcm)
                     )
-                    await self._send(protocol.asr_failed(event.item_id, "asr_error"))
+                    await self._send(
+                        protocol.asr_failed(
+                            event.item_id, protocol.REASON_ASR_ERROR
+                        )
+                    )
                     return
             asr_wall_ms = (time.perf_counter() - asr_started) * 1000.0
             text = (result.text or "").strip()
@@ -997,10 +1001,32 @@ class Session:
                 await self._send(protocol.response_done(ctx, "empty"), ctx=ctx)
         except asyncio.CancelledError:
             raise
+        except TtsUnavailableError as exc:
+            logger.warning(
+                "tts unavailable response=%s chars=%d",
+                ctx.response_id,
+                len(exc.text or ""),
+            )
+            text = (exc.text or "").strip()
+            if text:
+                self._history.append(self._assistant_entry(text, []))
+                self._trim_history()
+            if not self._closed and ctx.generation == self._generation:
+                await self._send(
+                    protocol.response_done(
+                        ctx, "failed", reason=protocol.REASON_TTS_UNAVAILABLE
+                    ),
+                    ctx=ctx,
+                )
         except Exception:
             logger.exception("turn failed response=%s", ctx.response_id)
             if not self._closed and ctx.generation == self._generation:
-                await self._send(protocol.response_done(ctx, "failed"), ctx=ctx)
+                await self._send(
+                    protocol.response_done(
+                        ctx, "failed", reason=protocol.REASON_LLM_ERROR
+                    ),
+                    ctx=ctx,
+                )
         finally:
             self._finish_response(ctx)
 
@@ -1011,10 +1037,24 @@ class Session:
             await self._speak(ctx, text, emit_text=False)
         except asyncio.CancelledError:
             raise
+        except TtsUnavailableError:
+            logger.warning("greeting tts unavailable response=%s", ctx.response_id)
+            if not self._closed and ctx.generation == self._generation:
+                await self._send(
+                    protocol.response_done(
+                        ctx, "failed", reason=protocol.REASON_TTS_UNAVAILABLE
+                    ),
+                    ctx=ctx,
+                )
         except Exception:
             logger.exception("greeting failed response=%s", ctx.response_id)
             if not self._closed and ctx.generation == self._generation:
-                await self._send(protocol.response_done(ctx, "failed"), ctx=ctx)
+                await self._send(
+                    protocol.response_done(
+                        ctx, "failed", reason=protocol.REASON_TTS_ERROR
+                    ),
+                    ctx=ctx,
+                )
         finally:
             self._finish_response(ctx)
 
@@ -1083,6 +1123,7 @@ class Session:
         buffer = ""
         full = ""
         first_chunk = True
+        text_done_sent = False
         try:
             async for delta in source:
                 if not isinstance(delta, str) or not delta:
@@ -1109,8 +1150,23 @@ class Session:
                     await self._synthesize_into(pacer, chunk, ctx)
             await pacer.finish()
             if emit_text and full:
-                await self._send(protocol.text_done(ctx, full), ctx=ctx)
+                if await self._send(protocol.text_done(ctx, full), ctx=ctx):
+                    text_done_sent = True
             return full
+        except TtsUnavailableError as exc:
+            # Stop the partial audio before putting text_done on the wire:
+            # the pacer must not emit another delta after the final text.
+            pacer.cancel()
+            # Never lose the answer just because audio could not be produced.
+            # The LLM may still have text/tool_calls queued behind the clause
+            # that failed; drain briefly (without synthesising or emitting
+            # deltas) so the failed turn keeps its full text and tool calls.
+            if emit_text:
+                full = await self._drain_source(source, full, ctx)
+                if full and not text_done_sent:
+                    await self._send(protocol.text_done(ctx, full), ctx=ctx)
+            exc.text = full
+            raise
         finally:
             pacer.cancel()
             # Close the upstream generator explicitly: a speculative LLM
@@ -1122,18 +1178,47 @@ class Session:
                 except Exception:
                     pass
 
+    async def _drain_source(self, source, full: str, ctx) -> str:
+        """Collect the rest of a failed turn's text/tool calls, best effort."""
+        timeout = float(self._settings.tts_failure_drain_s)
+        if timeout <= 0:
+            return full
+
+        async def drain() -> None:
+            nonlocal full
+            async for delta in source:
+                if isinstance(delta, str) and delta:
+                    full += delta
+
+        try:
+            await asyncio.wait_for(drain(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.info(
+                "tts failure drain timeout response=%s", ctx.response_id
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The LLM stream failed as well; keep whatever text we have.
+            pass
+        return full
+
     async def _run_deepseek_turn(
         self, ctx: protocol.ResponseContext, transcript: str
     ) -> None:
         spec = self._turn_spec_llm
         self._turn_spec_llm = None
+        # Kept outside the loop so the TTS-failure handler can see the calls
+        # collected for the hop that failed.
+        tool_calls: list[protocol.ToolCall] = []
+        text_parts: list[str] = []
         try:
             if self._deepseek is None:
                 raise RuntimeError("DeepSeek backend not initialized")
             for hop in range(3):
                 use_spec = hop == 0 and spec is not None
-                tool_calls: list[protocol.ToolCall] = []
-                text_parts: list[str] = []
+                tool_calls = []
+                text_parts = []
 
                 async def delta_source():
                     if use_spec and spec is not None:
@@ -1169,46 +1254,14 @@ class Session:
 
                 text = await self._stream_speech(ctx, text_source(), emit_text=True)
                 if tool_calls:
-                    self._history.append(
-                        {
-                            "role": "assistant",
-                            "content": text or None,
-                            "tool_calls": [
-                                {
-                                    "id": call.call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": call.name,
-                                        "arguments": call.arguments,
-                                    },
-                                }
-                                for call in tool_calls
-                            ],
-                        }
-                    )
-                    results = await self._run_tools(ctx, tool_calls)
-                    if results is None:
+                    if not await self._run_tool_hop(ctx, text, tool_calls):
                         return
-                    if not results:
-                        # All calls were filtered (e.g. a hallucinated
-                        # ask_expert).  Keep the OpenAI tool-call chain valid.
-                        for call in tool_calls:
-                            self._history.append(
-                                {
-                                    "role": "tool",
-                                    "tool_call_id": call.call_id,
-                                    "name": call.name,
-                                    "content": "该工具不可用，请直接回答。",
-                                }
-                            )
-                    self._trim_history()
                     await self._send(protocol.response_done(ctx, "tool_calls"), ctx=ctx)
                     ctx = self._begin_response()
                     self._schedule_backchannel(ctx)
                     continue
                 if text:
-                    self._history.append({"role": "assistant", "content": text})
-                    self._trim_history()
+                    self._append_assistant(text, [])
                 await self._send(
                     protocol.response_done(ctx, "completed" if text else "empty"), ctx=ctx
                 )
@@ -1216,14 +1269,117 @@ class Session:
             await self._send(protocol.response_canceled(ctx), force=True)
         except asyncio.CancelledError:
             raise
+        except TtsUnavailableError as exc:
+            text = (exc.text or "").strip()
+            logger.warning(
+                "tts unavailable response=%s chars=%d tools=%d",
+                ctx.response_id,
+                len(text),
+                len(tool_calls),
+            )
+            # Requirement: a failed turn must not disappear from history.  The
+            # assistant entry keeps the text that was already generated and,
+            # when the model had started a tool, the tool_calls too.
+            if text or tool_calls:
+                self._append_assistant(text, tool_calls)
+                self._trim_history()
+            if tool_calls:
+                if not self._closed and ctx.generation == self._generation:
+                    # TTS failed before the tool ran.  Run it and record the
+                    # result so the next user turn does not call it again.
+                    await self._finish_tool_calls(ctx, tool_calls)
+                else:
+                    # The turn was canceled/closed; still keep the OpenAI
+                    # tool-call chain valid for the next request.
+                    self._append_tool_placeholders(
+                        tool_calls, "工具调用未完成，请勿重复调用。"
+                    )
+                    self._trim_history()
+            if not self._closed and ctx.generation == self._generation:
+                await self._send(
+                    protocol.response_done(
+                        ctx, "failed", reason=protocol.REASON_TTS_UNAVAILABLE
+                    ),
+                    ctx=ctx,
+                )
         except Exception:
             logger.exception("deepseek turn failed response=%s", ctx.response_id)
             if not self._closed and ctx.generation == self._generation:
-                await self._send(protocol.response_done(ctx, "failed"), ctx=ctx)
+                await self._send(
+                    protocol.response_done(
+                        ctx, "failed", reason=protocol.REASON_LLM_ERROR
+                    ),
+                    ctx=ctx,
+                )
         finally:
             if spec is not None:
                 spec.cancel()
             self._finish_response(ctx)
+
+    @staticmethod
+    def _assistant_entry(
+        text: str, tool_calls: list[protocol.ToolCall]
+    ) -> dict[str, Any]:
+        entry: dict[str, Any] = {"role": "assistant", "content": text or None}
+        if tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    },
+                }
+                for call in tool_calls
+            ]
+        return entry
+
+    def _append_assistant(
+        self, text: str, tool_calls: list[protocol.ToolCall]
+    ) -> None:
+        self._history.append(self._assistant_entry(text, tool_calls))
+
+    def _append_tool_placeholders(
+        self, calls: list[protocol.ToolCall], content: str
+    ) -> None:
+        for call in calls:
+            self._history.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "name": call.name,
+                    "content": content,
+                }
+            )
+
+    async def _finish_tool_calls(
+        self, ctx: protocol.ResponseContext, calls: list[protocol.ToolCall]
+    ) -> bool:
+        """Run calls whose assistant entry is already in history."""
+        results = await self._run_tools(ctx, calls)
+        if results is None:
+            # Keep the tool-call chain valid even if the app never answered;
+            # the next model turn must not repeat the call.
+            self._append_tool_placeholders(
+                calls, "工具调用未完成，请勿重复调用。"
+            )
+            self._trim_history()
+            return False
+        if not results:
+            # All calls were filtered (e.g. a hallucinated ask_expert).
+            self._append_tool_placeholders(calls, "该工具不可用，请直接回答。")
+        self._trim_history()
+        return True
+
+    async def _run_tool_hop(
+        self,
+        ctx: protocol.ResponseContext,
+        text: str,
+        tool_calls: list[protocol.ToolCall],
+    ) -> bool:
+        self._append_assistant(text, tool_calls)
+        return await self._finish_tool_calls(ctx, tool_calls)
 
     def _build_llm_messages(self) -> list[dict[str, Any]]:
         return [
@@ -1240,13 +1396,22 @@ class Session:
         if not chunk:
             return
         first_pcm = True
-        async for pcm in self._tts.synthesize(chunk, self._voice, ctx.generation):
-            if first_pcm:
-                first_pcm = False
-                if self._first_audio_generation != ctx.generation:
-                    self._first_audio_generation = ctx.generation
-                    self._log_first_audio(ctx)
-            await pacer.feed(pcm)
+        try:
+            async for pcm in self._tts.synthesize(chunk, self._voice, ctx.generation):
+                if first_pcm:
+                    first_pcm = False
+                    if self._first_audio_generation != ctx.generation:
+                        self._first_audio_generation = ctx.generation
+                        self._log_first_audio(ctx)
+                await pacer.feed(pcm)
+        except TtsUnavailableError:
+            raise
+        except Exception as exc:
+            # Any backend-level synthesis failure is a TTS outage for this
+            # turn; the caller must not treat it as a generic LLM failure.
+            raise TtsUnavailableError(
+                f"TTS synthesis failed: {type(exc).__name__}"
+            ) from exc
 
     def _log_first_audio(self, ctx: protocol.ResponseContext) -> None:
         if self._turn_started_at is None:

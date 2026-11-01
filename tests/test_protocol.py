@@ -20,6 +20,19 @@ def test_audio_started_before_delta_contract():
     assert "delta" in delta
 
 
+def test_response_done_reason_is_additive():
+    ctx = protocol.ResponseContext("resp_3", 3)
+    completed = protocol.response_done(ctx)
+    assert completed["status"] == "completed"
+    assert "reason" not in completed
+
+    failed = protocol.response_done(
+        ctx, "failed", reason=protocol.REASON_TTS_UNAVAILABLE
+    )
+    assert failed["status"] == "failed"
+    assert failed["reason"] == "tts_unavailable"
+
+
 def test_tool_call_items_shape():
     ctx = protocol.ResponseContext("resp_2", 2)
     event = protocol.tool_call_done(

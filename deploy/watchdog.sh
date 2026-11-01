@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Lightweight health watchdog for a single-host EchoBridge deployment.
 #
-# It runs from a systemd timer every 30 s.  A unit that fails three checks in a
-# row is restarted; systemd's own Restart=always handles hard crashes.
+# It runs from a systemd timer every 30 s.  A unit that fails two checks in a
+# row is restarted (60 s); systemd's own Restart=always handles hard crashes.
+# The engine-death supervisor in scripts/tts_vllm.sh exits much sooner for a
+# dead vLLM-Omni stage, so this is only the last-resort path.
 set -uo pipefail
 
 MODE="${ECHOBRIDGE_WATCHDOG_MODE:-user}"
@@ -11,7 +13,7 @@ ASR_URL="${ECHOBRIDGE_ASR_URL:-http://127.0.0.1:18801}"
 TTS_URL="${ECHOBRIDGE_TTS_URL:-http://127.0.0.1:18802}"
 ASR_BACKEND="${ECHOBRIDGE_ASR_BACKEND:-mock}"
 TTS_BACKEND="${ECHOBRIDGE_TTS_BACKEND:-mock}"
-THRESHOLD="${ECHOBRIDGE_WATCHDOG_FAILURES:-3}"
+THRESHOLD="${ECHOBRIDGE_WATCHDOG_FAILURES:-2}"
 GRACE_S="${ECHOBRIDGE_WATCHDOG_GRACE_S:-300}"
 
 if [[ "$MODE" == "system" ]]; then

@@ -155,6 +155,14 @@ class Settings:
     # so ensure_warm() would be a no-op.  Probe the worker and force one real
     # synthesis request on a down -> up edge.  0 disables the watcher.
     tts_recovery_probe_s: float = 10.0
+    # Idle keepalive: synthesise one very short sentence and discard it when
+    # no response is active and the worker has been idle for this long.
+    # Keeps the WSL2 CUDA context warm; 0 disables it.
+    tts_keepalive_s: float = 600.0
+    # After a TTS error, keep draining the LLM stream briefly so tool calls
+    # that were produced after the spoken text still enter history.  This is
+    # not a retry: it only collects text/tool_calls for the failed turn.
+    tts_failure_drain_s: float = 2.0
     # In-process Qwen3-TTS (``ECHOBRIDGE_TTS_BACKEND=inprocess``).  The HF
     # implementation is experimental; vLLM-Omni remains the default when it is
     # available.  See docs/PHASE7.md for the measured comparison.
@@ -319,6 +327,12 @@ class Settings:
             tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),
             tts_recovery_probe_s=float(
                 os.environ.get("ECHOBRIDGE_TTS_RECOVERY_PROBE_S", "10")
+            ),
+            tts_keepalive_s=float(
+                os.environ.get("ECHOBRIDGE_TTS_KEEPALIVE_S", "600")
+            ),
+            tts_failure_drain_s=float(
+                os.environ.get("ECHOBRIDGE_TTS_FAILURE_DRAIN_S", "2")
             ),
             tts_model=os.environ.get(
                 "ECHOBRIDGE_TTS_MODEL",

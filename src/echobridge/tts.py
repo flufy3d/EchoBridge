@@ -10,6 +10,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 import zlib
 from collections import OrderedDict
 from collections.abc import AsyncIterator
@@ -31,6 +32,25 @@ from .voices import VoiceRegistry, VoiceSpec, load_voice_registry
 logger = get_logger("echobridge.tts")
 
 GREETING = "你来啦，我在呢。"
+# Tiny sentence used by the idle keepalive.  It is never played.  Do not use a
+# one-character filler here: Qwen3-TTS can fail to emit codec EOS for "嗯。"
+# and then hits its 192-token ceiling (Qwen3TTSCodecLimitError).  "我在呢。" was
+# verified to terminate reliably in ~0.6 s on the 3070.
+KEEPALIVE_TEXT = "我在呢。"
+
+
+class TtsUnavailableError(RuntimeError):
+    """The TTS worker could not serve this request.
+
+    The gateway distinguishes this from an LLM/ASR failure so it can keep the
+    already-generated text and tell the client why the turn failed.  ``text``
+    is filled in by the session with the full text generated before the
+    synthesis error; it is not part of the worker error itself.
+    """
+
+    def __init__(self, message: str = "tts unavailable", *, text: str = "") -> None:
+        super().__init__(message)
+        self.text = text
 
 
 def load_backchannel_clips(
@@ -109,6 +129,9 @@ class MockTTS:
         self._registry = registry or load_voice_registry(settings)
         self._first_chunk_delay = max(0, settings.tts_first_chunk_ms) / 1000.0
         self._wav: bytes | None = None
+        # Monotonic time of the last synthesis attempt.  The idle keepalive
+        # uses it so a normal reply delays the next probe by a full interval.
+        self.last_synthesis_at = 0.0
         if settings.mock_tts_wav:
             self._wav = load_wav_mono_24k(settings.mock_tts_wav)
 
@@ -123,6 +146,7 @@ class MockTTS:
     ) -> AsyncIterator[bytes]:
         if not text.strip():
             return
+        self.last_synthesis_at = time.monotonic()
         if self._first_chunk_delay:
             await asyncio.sleep(self._first_chunk_delay)
         if self._wav is not None:
@@ -185,6 +209,7 @@ class Qwen3TTSClient:
             load_backchannel_clips(settings, self._registry)
         )
         self._cache_max = 8
+        self.last_synthesis_at = 0.0
         self._warm_locks = {
             spec.id: asyncio.Lock() for spec in self._registry.voices
         }
@@ -199,25 +224,41 @@ class Qwen3TTSClient:
         pinned = self._backchannel_cache.get(key)
         return pinned if pinned is not None else self._cache.get(key)
 
-    async def _fetch(self, text: str, voice: str, generation: int = 0) -> bytes:
+    async def _fetch(
+        self, text: str, voice: str, generation: int = 0, *, cache: bool = True
+    ) -> bytes:
         voice = self._resolve_voice(voice)
         key = (voice, text)
-        cached = self._cache.get(key)
-        if cached is not None:
-            self._cache.move_to_end(key)
-            return cached
-        response = await self._client.post(
-            "/v1/synthesize",
-            json={"text": text, "voice_id": voice, "generation": generation},
-        )
-        response.raise_for_status()
+        if cache:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                return cached
+        self.last_synthesis_at = time.monotonic()
+        try:
+            response = await self._client.post(
+                "/v1/synthesize",
+                json={"text": text, "voice_id": voice, "generation": generation},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # Keep the body out of the log/message: it can contain request
+            # metadata, and the status code is enough for the gateway.
+            raise TtsUnavailableError(
+                f"TTS worker HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise TtsUnavailableError(
+                f"TTS worker {type(exc).__name__}"
+            ) from exc
         pcm = response.content
         if not pcm:
-            raise RuntimeError("TTS worker returned empty audio")
-        self._cache[key] = pcm
-        self._cache.move_to_end(key)
-        while len(self._cache) > self._cache_max:
-            self._cache.popitem(last=False)
+            raise TtsUnavailableError("TTS worker returned empty audio")
+        if cache:
+            self._cache[key] = pcm
+            self._cache.move_to_end(key)
+            while len(self._cache) > self._cache_max:
+                self._cache.popitem(last=False)
         return pcm
 
     async def synthesize(
@@ -232,6 +273,10 @@ class Qwen3TTSClient:
             chunk = pcm[offset : offset + block]
             if chunk:
                 yield chunk
+
+    async def keepalive(self, voice_id: str) -> None:
+        """Probe the worker without touching the reply/backchannel caches."""
+        await self._fetch(KEEPALIVE_TEXT, voice_id, cache=False)
 
     async def _warm_voice(self, voice: str) -> None:
         voice = self._resolve_voice(voice)
@@ -347,6 +392,7 @@ class VLLMTTSClient:
             load_backchannel_clips(settings, self._registry)
         )
         self._cache_max = 8
+        self.last_synthesis_at = 0.0
         self._warm_locks = {
             spec.id: asyncio.Lock() for spec in self._registry.voices
         }
@@ -384,23 +430,39 @@ class VLLMTTSClient:
 
     async def _stream(self, text: str, voice: str) -> AsyncIterator[bytes]:
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        async with self._client.stream(
-            "POST", "/v1/audio/speech", json=self._payload(text, voice), headers=headers
-        ) as response:
-            if response.status_code != 200:
-                detail = (await response.aread()).decode("utf-8", "replace")
-                raise RuntimeError(f"vLLM TTS HTTP {response.status_code}: {detail[:300]}")
-            leftover = b""
-            async for chunk in response.aiter_bytes():
-                if not chunk:
-                    continue
-                data = leftover + chunk
-                usable = len(data) - (len(data) % 2)
-                leftover = data[usable:]
-                if usable:
-                    yield data[:usable]
-            if leftover:
-                yield leftover + bytes(1)
+        try:
+            async with self._client.stream(
+                "POST",
+                "/v1/audio/speech",
+                json=self._payload(text, voice),
+                headers=headers,
+            ) as response:
+                if response.status_code != 200:
+                    # The body is an OpenAI-style error object (request id and
+                    # stage), never the reference audio; cap it at 300 chars.
+                    detail = (await response.aread()).decode("utf-8", "replace")
+                    raise TtsUnavailableError(
+                        f"vLLM TTS HTTP {response.status_code}: {detail[:300]}"
+                    )
+                leftover = b""
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    data = leftover + chunk
+                    usable = len(data) - (len(data) % 2)
+                    leftover = data[usable:]
+                    if usable:
+                        yield data[:usable]
+                if leftover:
+                    yield leftover + bytes(1)
+        except TtsUnavailableError:
+            raise
+        except httpx.HTTPError as exc:
+            # Connect errors and a worker that dies mid-stream both surface
+            # here.  Do not include the URL: it is local and uninteresting.
+            raise TtsUnavailableError(
+                f"vLLM TTS transport error: {type(exc).__name__}"
+            ) from exc
 
     async def synthesize(
         self, text: str, voice_id: str, generation: int
@@ -424,6 +486,7 @@ class VLLMTTSClient:
             for offset in range(0, len(cached), 4800):
                 yield cached[offset : offset + 4800]
             return
+        self.last_synthesis_at = time.monotonic()
         collected = bytearray()
         async for chunk in self._stream(text, voice):
             collected.extend(chunk)
@@ -434,6 +497,13 @@ class VLLMTTSClient:
             while len(self._cache) > self._cache_max:
                 self._cache.popitem(last=False)
 
+    async def keepalive(self, voice_id: str) -> None:
+        """Probe the worker directly, bypassing the reply PCM cache."""
+        self.last_synthesis_at = time.monotonic()
+        voice = self._resolve_voice(voice_id)
+        async for _ in self._stream(KEEPALIVE_TEXT, voice):
+            pass
+
     def cached(self, text: str, voice_id: str) -> bytes | None:
         key = (self._resolve_voice(voice_id), text.strip())
         pinned = self._backchannel_cache.get(key)
@@ -442,6 +512,7 @@ class VLLMTTSClient:
     async def _prefetch(self, text: str, voice: str) -> bytes:
         voice = self._resolve_voice(voice)
         key = (voice, text)
+        self.last_synthesis_at = time.monotonic()
         cached = self._cache.get(key)
         if cached is not None:
             self._cache.move_to_end(key)

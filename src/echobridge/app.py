@@ -17,6 +17,7 @@ from . import __version__
 from .asr import make_asr
 from .config import Settings
 from .gpu import get_gpu_scheduler
+from .keepalive import TtsKeepalive
 from .logging import get_logger
 from .manager import SessionManager
 from .tts import make_tts
@@ -264,12 +265,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 _watch_tts_recovery(settings, shared_tts, manager),
                 name="tts-recovery-watch",
             )
+        tts_keepalive = None
+        if shared_tts is not None and settings.tts_keepalive_s > 0:
+            tts_keepalive = asyncio.create_task(
+                TtsKeepalive(
+                    shared_tts,
+                    settings.tts_voice_id,
+                    settings.tts_keepalive_s,
+                    is_busy=lambda: bool(
+                        manager.active is not None and manager.active.busy
+                    ),
+                ).run(),
+                name="tts-keepalive",
+            )
         try:
             yield
         finally:
             if tts_watch is not None:
                 tts_watch.cancel()
                 await asyncio.gather(tts_watch, return_exceptions=True)
+            if tts_keepalive is not None:
+                tts_keepalive.cancel()
+                await asyncio.gather(tts_keepalive, return_exceptions=True)
             await manager.close_active("shutdown")
             if shared_asr is not None:
                 await shared_asr.close()

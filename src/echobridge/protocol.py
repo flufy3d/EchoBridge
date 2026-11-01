@@ -49,6 +49,15 @@ BACKCHANNEL = "response.backchannel"
 ERROR = "error"
 
 
+# Optional ``reason`` short codes on response.done(status="failed").  The
+# field is additive: old clients ignore unknown fields, and ``status`` keeps
+# its existing value set.
+REASON_TTS_UNAVAILABLE = "tts_unavailable"
+REASON_TTS_ERROR = "tts_error"
+REASON_LLM_ERROR = "llm_error"
+REASON_ASR_ERROR = "asr_error"
+
+
 @dataclass(slots=True)
 class ResponseContext:
     """Identity of one model/TTS response.
@@ -216,8 +225,13 @@ def tool_call_done(ctx: ResponseContext, calls: list[ToolCall]) -> dict[str, Any
     }
 
 
-def response_done(ctx: ResponseContext, status: str = "completed") -> dict[str, Any]:
-    return {"type": RESPONSE_DONE, **_response_header(ctx), "status": status}
+def response_done(
+    ctx: ResponseContext, status: str = "completed", reason: str | None = None
+) -> dict[str, Any]:
+    event = {"type": RESPONSE_DONE, **_response_header(ctx), "status": status}
+    if reason:
+        event["reason"] = reason
+    return event
 
 
 def response_canceled(ctx: ResponseContext) -> dict[str, Any]:

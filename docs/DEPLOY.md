@@ -123,6 +123,11 @@ ECHOBRIDGE_ASR_DEVICE=cuda:0
 ECHOBRIDGE_ASR_URL=http://127.0.0.1:18801
 ECHOBRIDGE_TTS_BACKEND=vllm
 ECHOBRIDGE_TTS_URL=http://127.0.0.1:18802
+# 空闲保活；0 关闭。根因与故障兜底见 docs/TTS_RESILIENCE.md。
+ECHOBRIDGE_TTS_KEEPALIVE_S=600
+ECHOBRIDGE_TTS_ENGINE_SUPERVISOR=1
+ECHOBRIDGE_TTS_ENGINE_PROBE_S=5
+ECHOBRIDGE_TTS_ENGINE_FAILURES=2
 ECHOBRIDGE_LLM_BACKEND=deepseek
 ECHOBRIDGE_LLM_API_KEY=<只放 env>
 # 单会话瘦身：Stage 0 0.30 + Stage 1 0.18；旧值 0.40。
@@ -199,13 +204,18 @@ bash deploy/status.sh --system      # 原生
 
 Watchdog 每 30 s 检查：
 
-- 网关 `/healthz`（连续 3 次失败 → 重启网关）；进程内 ASR 的就绪状态在
-  `/readyz` 的 `workers.asr` 中直接可见；
+- 网关 `/healthz`（默认连续 2 次失败 → 重启网关，`ECHOBRIDGE_WATCHDOG_FAILURES`
+  可调）；进程内 ASR 的就绪状态在 `/readyz` 的 `workers.asr` 中直接可见；
 - 当 `ECHOBRIDGE_ASR_BACKEND=vllm` 时检查 `echobridge-asr-vllm` 的 `/health`；
   当 `qwen3` 时检查 `echobridge-asr` 的 `/healthz`；
 - TTS `/health`（vLLM）或 `/healthz`（HF）；
 - 冷启动宽限 `ECHOBRIDGE_WATCHDOG_GRACE_S`（默认 300 s）：`Type=simple` 的 worker 刚启动就显示 active，但模型可能还在加载；宽限期内不重启，避免把正在加载的 TTS 反复杀掉；
-- 进程崩溃由 systemd `Restart=always` 兜底；watchdog 只处理“进程在但无响应”。
+- 进程崩溃由 systemd `Restart=always` 兜底；watchdog 只处理“进程在但无响应”；
+- vLLM-Omni 的 API server 可能在 stage-0 engine 死后继续存活并返回 500。
+  `scripts/tts_vllm.sh` 内置 supervisor：启动成功后 `/health` 连续
+  `ECHOBRIDGE_TTS_ENGINE_FAILURES` 次失败（每 `ECHOBRIDGE_TTS_ENGINE_PROBE_S`
+  秒一次）就主动退出，让 systemd 立即拉起干净进程。故障分析见
+  `docs/TTS_RESILIENCE.md`。
 
 维护时先停 watchdog，避免手工 stop 的 unit 被拉起来：
 
