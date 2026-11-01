@@ -122,6 +122,9 @@ ECHOBRIDGE_LLM_TOTAL_TIMEOUT_S=30
 
 - `var/llm.env` 已加入 `.gitignore`；本机测试从 `mingyue-live/local.properties` 生成，权限 600。
 - 日志/提交中无 API key。
+- 首 content 超时（`ECHOBRIDGE_LLM_FIRST_TOKEN_TIMEOUT_S`）按“上游卡死”处理：
+  立即重发（最多 3 次）。已经吐出过文本后不再重试，避免同一句话开头播两遍。
+  HTTP 429/5xx 仍按 1 s / 2 s 退避重试。
 
 ## 6. 测试
 

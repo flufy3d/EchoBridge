@@ -17,6 +17,16 @@ from .protocol import ToolCall
 
 logger = get_logger("echobridge.deepseek")
 
+# Backoff between attempts.  A stall is retried immediately: the previous
+# request was already silent for the whole first-token budget, so waiting
+# another second only stretches the silence the user hears.
+RETRY_DELAYS: tuple[float, float] = (1.0, 2.0)
+STALL_RETRY_DELAYS: tuple[float, float] = (0.0, 2.0)
+
+
+class FirstContentTimeout(TimeoutError):
+    """The stream opened but produced nothing in time -- safe to retry."""
+
 
 class DeepSeekLLM:
     def __init__(self, settings: Settings) -> None:
@@ -117,6 +127,9 @@ class DeepSeekLLM:
         started = time.perf_counter()
         for attempt in range(3):
             attempt_started = time.perf_counter()
+            # Set once a delta reached the caller.  Retrying after that point
+            # would speak the beginning of the answer twice.
+            emitted = False
             try:
                 async with self._client.stream(
                     "POST", self._settings.llm_url, json=payload, headers=headers
@@ -124,7 +137,7 @@ class DeepSeekLLM:
                     if response.status_code in (429, 500, 502, 503, 504):
                         body = (await response.aread()).decode("utf-8", "replace")
                         if attempt < 2:
-                            delay = 1.0 if attempt == 0 else 2.0
+                            delay = RETRY_DELAYS[attempt]
                             logger.warning(
                                 "llm http %d, retry in %.1fs", response.status_code, delay
                             )
@@ -139,14 +152,28 @@ class DeepSeekLLM:
                             f"DeepSeek HTTP {response.status_code}: {body[:200]}"
                         )
                     async for delta in self._parse_sse(response, attempt_started):
+                        emitted = True
                         yield delta
                     logger.info("llm stream done in %.0f ms", (time.perf_counter() - started) * 1000)
                     return
+            except FirstContentTimeout:
+                # The provider answered 200 and then never streamed a token.
+                # That is a wedged upstream connection, not a slow model: retry
+                # instead of dropping the turn and leaving the user in silence.
+                if emitted or attempt == 2:
+                    raise
+                delay = STALL_RETRY_DELAYS[attempt]
+                logger.warning(
+                    "llm stalled %.0f ms before first content, retry %d in %.1fs",
+                    (time.perf_counter() - attempt_started) * 1000.0,
+                    attempt + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
             except (httpx.TimeoutException, httpx.NetworkError):
-                if attempt < 2:
-                    await asyncio.sleep(1.0 if attempt == 0 else 2.0)
-                    continue
-                raise
+                if emitted or attempt == 2:
+                    raise
+                await asyncio.sleep(RETRY_DELAYS[attempt])
         raise RuntimeError("DeepSeek request failed after retries")
 
     async def _parse_sse(
@@ -176,7 +203,7 @@ class DeepSeekLLM:
                 break
             except asyncio.TimeoutError as exc:
                 if not first_content and not first_tool:
-                    raise TimeoutError("DeepSeek first content timeout") from exc
+                    raise FirstContentTimeout("DeepSeek first content timeout") from exc
                 raise TimeoutError("DeepSeek stream timeout") from exc
             if not line:
                 continue
