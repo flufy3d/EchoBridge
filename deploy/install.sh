@@ -157,12 +157,14 @@ WORKER_UNITS=""
 ASR_UNIT_ENABLE=0
 ASR_VLLM_UNIT_ENABLE=0
 TTS_UNIT_ENABLE=0
+PROBE_TIMER_ENABLE=0
 if [[ "$ASR_BACKEND" == "qwen3" ]]; then
   WORKER_UNITS="$WORKER_UNITS echobridge-asr.service"
   ASR_UNIT_ENABLE=1
 elif [[ "$ASR_BACKEND" == "vllm" ]]; then
   WORKER_UNITS="$WORKER_UNITS echobridge-asr-vllm.service"
   ASR_VLLM_UNIT_ENABLE=1
+  PROBE_TIMER_ENABLE=1
 fi
 if [[ "$TTS_BACKEND" == "vllm" || "$TTS_BACKEND" == "qwen3" ]]; then
   WORKER_UNITS="$WORKER_UNITS echobridge-tts.service"
@@ -174,12 +176,16 @@ render "$ROOT/deploy/systemd/echobridge-gateway.service.in" "$UNIT_DIR/echobridg
 render "$ROOT/deploy/systemd/echobridge-asr.service.in" "$UNIT_DIR/echobridge-asr.service"
 render "$ROOT/deploy/systemd/echobridge-asr-vllm.service.in" "$UNIT_DIR/echobridge-asr-vllm.service"
 render "$ROOT/deploy/systemd/echobridge-tts.service.in" "$UNIT_DIR/echobridge-tts.service"
+render "$ROOT/deploy/systemd/echobridge-asr-probe.service.in" "$UNIT_DIR/echobridge-asr-probe.service"
 render "$ROOT/deploy/systemd/echobridge-watchdog.service.in" "$UNIT_DIR/echobridge-watchdog.service"
 install -m 644 "$ROOT/deploy/systemd/echobridge-watchdog.timer" "$UNIT_DIR/echobridge-watchdog.timer"
+install -m 644 "$ROOT/deploy/systemd/echobridge-asr-probe.timer" "$UNIT_DIR/echobridge-asr-probe.timer"
 
-# The watchdog needs root for a system install; user units need no User= line.
+# The watchdog and probe restart workers for a system install; user units
+# need no User= line.
 if [[ "$MODE" == "system" ]]; then
   sed -i 's|^User=.*|User=root|' "$UNIT_DIR/echobridge-watchdog.service"
+  sed -i 's|^User=.*|User=root|' "$UNIT_DIR/echobridge-asr-probe.service"
 fi
 
 if ((STOP_LEGACY)); then
@@ -219,6 +225,11 @@ if ((ASR_VLLM_UNIT_ENABLE)); then
 else
   "${SYSTEMCTL[@]}" disable --now echobridge-asr-vllm.service >/dev/null 2>&1 || true
 fi
+if ((PROBE_TIMER_ENABLE)); then
+  ENABLE_UNITS+=(echobridge-asr-probe.timer)
+else
+  "${SYSTEMCTL[@]}" disable --now echobridge-asr-probe.timer >/dev/null 2>&1 || true
+fi
 if ((TTS_UNIT_ENABLE)); then
   ENABLE_UNITS=(echobridge-tts.service "${ENABLE_UNITS[@]}")
   # systemctl queues one job per unit in argument order, and the vLLM ASR
@@ -239,6 +250,9 @@ if ((START)); then
   echo "starting gateway (waits up to 300 s for model workers)..."
   "${SYSTEMCTL[@]}" restart echobridge-gateway.service
   "${SYSTEMCTL[@]}" restart echobridge-watchdog.timer
+  if ((PROBE_TIMER_ENABLE)); then
+    "${SYSTEMCTL[@]}" restart echobridge-asr-probe.timer
+  fi
 fi
 
 echo

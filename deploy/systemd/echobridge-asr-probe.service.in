@@ -1,0 +1,21 @@
+[Unit]
+Description=EchoBridge ASR probe
+Documentation=file://@ROOT@/docs/ASR_RESILIENCE.md
+After=network-online.target echobridge-asr-vllm.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@ROOT@
+Environment=HOME=@HOME@
+Environment=PYTHON=@PYTHON@
+Environment=ECHOBRIDGE_PROBE_MODE=@MODE@
+EnvironmentFile=@ENV_FILE@
+ExecStart=/bin/bash @ROOT@/deploy/asr-probe.sh
+# The probe may restart the ASR worker, whose ExecStartPost waits for the
+# model to load (~90 s).  Do not let the oneshot service time out first.
+TimeoutStartSec=600
+TimeoutStopSec=30
+Nice=10
+NoNewPrivileges=true

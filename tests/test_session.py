@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 
+from echobridge.asr import ASRResult, ASRUnavailableError, AsrHealth
 from echobridge.config import Settings
 from echobridge.protocol import dumps
 from echobridge.session import Session
@@ -19,6 +20,37 @@ from tests.helpers import (
     set_emotion_tool,
     silence_frame,
 )
+
+
+class _FlakyASR:
+    """Raises ASRUnavailableError for the first ``fail_calls`` requests."""
+
+    def __init__(self, fail_calls: int = 999, text: str = "你好呀，溟月") -> None:
+        self.asr_health = AsrHealth()
+        self.calls = 0
+        self._fail_calls = fail_calls
+        self._text = text
+
+    async def transcribe(
+        self,
+        pcm: bytes,
+        sample_rate: int = 16000,
+        context: str | None = None,
+        *,
+        speculative: bool = False,
+    ) -> ASRResult:
+        self.calls += 1
+        if self.calls <= self._fail_calls:
+            self.asr_health.mark_unavailable("ConnectError")
+            raise ASRUnavailableError("ASR worker ConnectError")
+        self.asr_health.mark_ok()
+        return ASRResult(self._text, "zh", 1.0)
+
+    async def warmup(self) -> None:
+        self.asr_health.mark_ok()
+
+    async def close(self) -> None:
+        return None
 
 
 async def start_session(
@@ -163,6 +195,42 @@ async def test_empty_asr_returns_to_listening_without_llm():
         assert not ws.events("conversation.item.input_audio_transcription.completed")
         assert not ws.events("response.output_text.delta")
         assert not ws.events("response.output_audio.started")
+    finally:
+        await stop_session(ws, session, task)
+
+
+async def test_asr_unavailable_is_retryable_and_not_empty_speech():
+    asr = _FlakyASR(fail_calls=999)
+    ws, session, task = await start_session(asr=asr)
+    try:
+        await speak_and_endpoint(ws)
+        failed = await ws.wait_for_type(
+            "conversation.item.input_audio_transcription.failed"
+        )
+        assert failed["error"] == "asr_unavailable"
+        assert failed["reason"] == "asr_unavailable"
+        assert failed["retryable"] is True
+        assert failed["error"] != "empty speech"
+        assert asr.calls >= 2  # speculative + at least one final retry
+        assert not ws.events("response.output_text.delta")
+        assert not ws.events("response.output_audio.started")
+    finally:
+        await stop_session(ws, session, task)
+
+
+async def test_asr_unavailable_retry_recovers_same_utterance():
+    asr = _FlakyASR(fail_calls=1)
+    ws, session, task = await start_session(asr=asr)
+    try:
+        await speak_and_endpoint(ws)
+        completed = await ws.wait_for_type(
+            "conversation.item.input_audio_transcription.completed"
+        )
+        assert completed["transcript"] == "你好呀，溟月"
+        response_done = await ws.wait_for_type("response.done")
+        assert response_done["status"] == "completed"
+        assert not ws.events("conversation.item.input_audio_transcription.failed")
+        assert asr.calls >= 2
     finally:
         await stop_session(ws, session, task)
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe the EchoBridge ASR worker every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=echobridge-asr-probe.service
+
+[Install]
+WantedBy=timers.target

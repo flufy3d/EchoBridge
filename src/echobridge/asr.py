@@ -98,6 +98,102 @@ class ASRResult:
     latency_ms: float = 0.0
 
 
+# 0.5 s of 16 kHz mono PCM silence.  The vLLM ASR path accepts it and returns
+# an empty transcript, which is enough to exercise the CUDA graph and the HTTP
+# stack without sending or logging user audio.
+SILENCE_PCM = b"\x00\x00" * 8_000
+
+
+class ASRUnavailableError(RuntimeError):
+    """The ASR worker is down, restarting, or temporarily overloaded."""
+
+
+class ASRError(RuntimeError):
+    """The ASR worker rejected this specific request (non-retryable)."""
+
+
+class AsrHealth:
+    """Process-local availability state shared by the ASR adapters.
+
+    This is deliberately a status record, not a circuit breaker: a session
+    still attempts the request after a failure, so a worker restarted by
+    systemd recovers on the next utterance without a separate probe.  The
+    fields are only used for classification, readiness and metrics.
+    """
+
+    def __init__(self) -> None:
+        self.available = True
+        self.last_ok = 0.0
+        self.last_error = ""
+        self.last_error_at = 0.0
+        self.unavailable_total = 0
+        self.error_total = 0
+        self.retry_total = 0
+        self.retry_success_total = 0
+
+    def mark_ok(self) -> None:
+        self.available = True
+        self.last_ok = time.time()
+        self.last_error = ""
+
+    def mark_unavailable(self, reason: str) -> None:
+        self.available = False
+        self.last_error = reason[:120]
+        self.last_error_at = time.time()
+        self.unavailable_total += 1
+
+    def mark_error(self, reason: str) -> None:
+        # A 4xx/parse error means the worker is reachable; do not mask it as
+        # unavailable, but keep the last error for diagnostics.
+        self.last_error = reason[:120]
+        self.last_error_at = time.time()
+        self.error_total += 1
+
+    def record_retry(self) -> None:
+        self.retry_total += 1
+
+    def record_retry_success(self) -> None:
+        self.retry_success_total += 1
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "available": self.available,
+            "last_ok": self.last_ok,
+            "last_error": self.last_error,
+            "unavailable_total": self.unavailable_total,
+            "error_total": self.error_total,
+            "retry_total": self.retry_total,
+            "retry_success_total": self.retry_success_total,
+        }
+
+    def metrics_lines(self) -> list[str]:
+        return [
+            "# HELP echobridge_asr_available ASR worker is currently usable.",
+            "# TYPE echobridge_asr_available gauge",
+            f"echobridge_asr_available {1 if self.available else 0}",
+            "# HELP echobridge_asr_unavailable_total "
+            "ASR attempts that failed because the worker was unavailable.",
+            "# TYPE echobridge_asr_unavailable_total counter",
+            f"echobridge_asr_unavailable_total {self.unavailable_total}",
+            "# HELP echobridge_asr_error_total "
+            "ASR attempts rejected with a non-retryable error.",
+            "# TYPE echobridge_asr_error_total counter",
+            f"echobridge_asr_error_total {self.error_total}",
+            "# HELP echobridge_asr_retry_total "
+            "ASR retry attempts triggered by unavailability.",
+            "# TYPE echobridge_asr_retry_total counter",
+            f"echobridge_asr_retry_total {self.retry_total}",
+            "# HELP echobridge_asr_retry_success_total "
+            "ASR retries that recovered the same utterance.",
+            "# TYPE echobridge_asr_retry_success_total counter",
+            f"echobridge_asr_retry_success_total {self.retry_success_total}",
+            "# HELP echobridge_asr_last_ok_timestamp_seconds "
+            "Unix time of the last successful ASR request.",
+            "# TYPE echobridge_asr_last_ok_timestamp_seconds gauge",
+            f"echobridge_asr_last_ok_timestamp_seconds {self.last_ok:.3f}",
+        ]
+
+
 class ASRBackend(Protocol):
     async def transcribe(
         self,
@@ -116,6 +212,7 @@ class ASRBackend(Protocol):
 class MockASR:
     def __init__(self, text: str) -> None:
         self._text = text.strip()
+        self.asr_health = AsrHealth()
 
     async def transcribe(
         self,
@@ -125,10 +222,11 @@ class MockASR:
         *,
         speculative: bool = False,
     ) -> ASRResult:
+        self.asr_health.mark_ok()
         return ASRResult(self._text, "zh", 0.0)
 
     async def warmup(self) -> None:
-        return None
+        self.asr_health.mark_ok()
 
     async def close(self) -> None:
         return None
@@ -143,6 +241,7 @@ class Qwen3ASRClient:
             timeout=httpx.Timeout(timeout_s, connect=2.0),
         )
         self._context = context.strip()
+        self.asr_health = AsrHealth()
 
     async def transcribe(
         self,
@@ -161,16 +260,36 @@ class Qwen3ASRClient:
         }
         if effective_context:
             headers["X-ASR-Context"] = encode_asr_context(effective_context)
-        response = await self._client.post(
-            "/v1/transcribe",
-            content=pcm,
-            headers=headers,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = await self._client.post(
+                "/v1/transcribe",
+                content=pcm,
+                headers=headers,
+            )
+        except httpx.TimeoutException as exc:
+            self.asr_health.mark_unavailable("timeout")
+            raise ASRUnavailableError("ASR worker timeout") from exc
+        except httpx.HTTPError as exc:
+            self.asr_health.mark_unavailable(type(exc).__name__)
+            raise ASRUnavailableError(
+                f"ASR worker {type(exc).__name__}"
+            ) from exc
+        if response.status_code != 200:
+            status = response.status_code
+            if status in (408, 429, 500, 502, 503, 504):
+                self.asr_health.mark_unavailable(f"HTTP {status}")
+                raise ASRUnavailableError(f"ASR worker HTTP {status}")
+            self.asr_health.mark_error(f"HTTP {status}")
+            raise ASRError(f"ASR worker HTTP {status}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self.asr_health.mark_error("invalid JSON")
+            raise ASRError("ASR worker returned invalid JSON") from exc
         text = str(payload.get("text") or "").strip()
         language = str(payload.get("language") or "")
         latency = float(payload.get("latency_ms") or 0.0)
+        self.asr_health.mark_ok()
         logger.info(
             "asr result chars=%d language=%s worker_ms=%.1f context=%s",
             len(text),
@@ -220,6 +339,7 @@ class VLLMASRClient:
             (settings.asr_language or "").strip().lower(),
         )
         self._max_tokens = max(1, settings.asr_max_new_tokens)
+        self.asr_health = AsrHealth()
 
     @staticmethod
     def _wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
@@ -254,17 +374,41 @@ class VLLMASRClient:
             data["prompt"] = effective_context
 
         started = time.perf_counter()
-        response = await self._client.post(
-            "/v1/audio/transcriptions",
-            files={"file": ("audio.wav", self._wav_bytes(pcm, sample_rate), "audio/wav")},
-            data=data,
-        )
+        try:
+            response = await self._client.post(
+                "/v1/audio/transcriptions",
+                files={
+                    "file": (
+                        "audio.wav",
+                        self._wav_bytes(pcm, sample_rate),
+                        "audio/wav",
+                    )
+                },
+                data=data,
+            )
+        except httpx.TimeoutException as exc:
+            self.asr_health.mark_unavailable("timeout")
+            raise ASRUnavailableError("vLLM ASR timeout") from exc
+        except httpx.HTTPError as exc:
+            self.asr_health.mark_unavailable(type(exc).__name__)
+            raise ASRUnavailableError(
+                f"vLLM ASR {type(exc).__name__}"
+            ) from exc
         wall_ms = (time.perf_counter() - started) * 1000.0
         if response.status_code != 200:
-            detail = response.text[:300]
-            raise RuntimeError(f"vLLM ASR HTTP {response.status_code}: {detail}")
-        payload = response.json()
+            status = response.status_code
+            if status in (408, 429, 500, 502, 503, 504):
+                self.asr_health.mark_unavailable(f"HTTP {status}")
+                raise ASRUnavailableError(f"vLLM ASR HTTP {status}")
+            self.asr_health.mark_error(f"HTTP {status}")
+            raise ASRError(f"vLLM ASR HTTP {status}")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            self.asr_health.mark_error("invalid JSON")
+            raise ASRError("vLLM ASR returned invalid JSON") from exc
         text = str(payload.get("text") or "").strip()
+        self.asr_health.mark_ok()
         logger.info(
             "asr vllm result chars=%d wall_ms=%.1f context=%s",
             len(text),
@@ -276,9 +420,8 @@ class VLLMASRClient:
     async def warmup(self) -> None:
         # A short silent request warms the CUDA graph path as well as the
         # keep-alive connection; failures are reported by the caller.
-        silence = b"\x00\x00" * 8_000  # 0.5 s @ 16 kHz
         try:
-            await self.transcribe(silence, 16000)
+            await self.transcribe(SILENCE_PCM, 16000)
         except Exception:
             await self._client.get("/health")
 
@@ -311,6 +454,7 @@ class InProcessQwen3ASR:
         self._thread_lock = threading.Lock()
         self._load_lock: asyncio.Lock | None = None
         self._context_warned = False
+        self.asr_health = AsrHealth()
 
     @property
     def loaded(self) -> bool:
@@ -340,6 +484,7 @@ class InProcessQwen3ASR:
                 )
             except Exception as exc:
                 self._load_error = f"{type(exc).__name__}: {exc}"
+                self.asr_health.mark_unavailable(f"load: {type(exc).__name__}")
                 logger.exception("inprocess asr load failed")
                 raise
 
@@ -388,6 +533,7 @@ class InProcessQwen3ASR:
             self._loaded_at = time.perf_counter()
             self._load_s = self._loaded_at - started
             self._load_error = ""
+            self.asr_health.mark_ok()
             logger.info(
                 "inprocess asr loaded path=%s load_s=%.2f vram_mb=%.1f context=%s",
                 self._model_path,
@@ -408,23 +554,37 @@ class InProcessQwen3ASR:
             raise ValueError("only 16 kHz input is supported")
         if not pcm:
             return ASRResult("", "", 0.0)
-        await self._ensure_loaded()
-        if self._model is None:
-            raise RuntimeError(self._load_error or "ASR model not loaded")
         priority = (
             PRIORITY_ASR_SPECULATIVE if speculative else PRIORITY_ASR_FINAL
         )
         effective_context = (context or "").strip()
         started = time.perf_counter()
-        payload = await self._scheduler.run(
-            "asr-spec" if speculative else "asr",
-            self._infer_sync,
-            pcm,
-            context=effective_context,
-            priority=priority,
-            timeout=self._settings.asr_timeout_s,
-        )
+        try:
+            await self._ensure_loaded()
+            if self._model is None:
+                raise RuntimeError(self._load_error or "ASR model not loaded")
+            payload = await self._scheduler.run(
+                "asr-spec" if speculative else "asr",
+                self._infer_sync,
+                pcm,
+                context=effective_context,
+                priority=priority,
+                timeout=self._settings.asr_timeout_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not self.loaded:
+                # _ensure_loaded already recorded the load failure.
+                raise ASRUnavailableError(
+                    f"in-process ASR unavailable: {type(exc).__name__}"
+                ) from exc
+            self.asr_health.mark_error(type(exc).__name__)
+            raise ASRError(
+                f"in-process ASR error: {type(exc).__name__}"
+            ) from exc
         wall_ms = (time.perf_counter() - started) * 1000.0
+        self.asr_health.mark_ok()
         logger.info(
             "asr result chars=%d language=%s infer_ms=%.1f wall_ms=%.1f "
             "spec=%s context=%s",

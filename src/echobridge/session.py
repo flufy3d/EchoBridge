@@ -23,7 +23,15 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from . import protocol
-from .asr import ASRBackend, MockASR, is_hotword_echo, parse_hotwords
+from .asr import (
+    ASRBackend,
+    ASRError,
+    ASRResult,
+    ASRUnavailableError,
+    MockASR,
+    is_hotword_echo,
+    parse_hotwords,
+)
 from .config import Settings, build_asr_context
 from .llm import MockLLM
 from .llm_deepseek import DeepSeekLLM
@@ -143,6 +151,8 @@ class Session:
 
         self._tts = tts or make_tts(settings, self._voice_registry)
         self._asr = asr or MockASR(self._mock_asr_text)
+        # Optional; real adapters attach an AsrHealth, test doubles may not.
+        self._asr_health = getattr(self._asr, "asr_health", None)
         self._vad = vad or make_vad(settings)
 
     # ------------------------------------------------------------------
@@ -480,6 +490,54 @@ class Session:
                 raise
             return await self._asr.transcribe(pcm, 16000, **kwargs)
 
+    async def _transcribe_with_retry(self, pcm: bytes) -> ASRResult:
+        """Retry an unavailable ASR worker for a short, bounded window.
+
+        A restart takes ~90 s, far longer than a user will wait, so this is
+        not an attempt to hide a cold worker.  It covers a brief HTTP 5xx /
+        connection blip and lets a just-restarted worker recover the current
+        utterance without turning it into a misleading "empty speech" event.
+        The whole loop is capped by ``asr_retry_budget_s`` so a wedged worker
+        cannot stall the turn.
+        """
+        attempts = max(1, self._settings.asr_retry_attempts)
+        budget_s = max(0.0, self._settings.asr_retry_budget_s)
+        deadline = time.monotonic() + budget_s
+        last: ASRUnavailableError | None = None
+        for attempt in range(attempts):
+            remaining = max(0.05, deadline - time.monotonic())
+            try:
+                result = await asyncio.wait_for(
+                    self._transcribe_pcm(pcm), timeout=remaining
+                )
+            except asyncio.TimeoutError as exc:
+                last = ASRUnavailableError("ASR timeout")
+                if self._asr_health is not None:
+                    self._asr_health.mark_unavailable("timeout")
+                if attempt + 1 >= attempts:
+                    break
+                continue
+            except ASRUnavailableError as exc:
+                last = exc
+                if attempt + 1 >= attempts:
+                    break
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                if self._asr_health is not None:
+                    self._asr_health.record_retry()
+                delay_s = max(0.0, self._settings.asr_retry_delay_ms / 1000.0)
+                await asyncio.sleep(
+                    min(delay_s * (2**attempt), max(0.0, deadline - now))
+                )
+                continue
+            if attempt > 0 and self._asr_health is not None:
+                self._asr_health.record_retry_success()
+            return result
+        if last is None:
+            last = ASRUnavailableError("ASR unavailable")
+        raise last
+
     async def _handle_audio(self, event: dict[str, Any]) -> None:
         if not self._created or self._closed:
             return
@@ -561,7 +619,32 @@ class Session:
             spec_llm: SpeculativeLLM | None = None
             if result is None:
                 try:
-                    result = await self._transcribe_pcm(event.pcm)
+                    result = await self._transcribe_with_retry(event.pcm)
+                except ASRUnavailableError:
+                    logger.warning(
+                        "asr unavailable item=%s bytes=%d",
+                        event.item_id,
+                        len(event.pcm),
+                    )
+                    await self._send(
+                        protocol.asr_failed(
+                            event.item_id,
+                            protocol.REASON_ASR_UNAVAILABLE,
+                            reason=protocol.REASON_ASR_UNAVAILABLE,
+                            retryable=True,
+                        )
+                    )
+                    return
+                except ASRError:
+                    logger.exception(
+                        "asr failed item=%s bytes=%d", event.item_id, len(event.pcm)
+                    )
+                    await self._send(
+                        protocol.asr_failed(
+                            event.item_id, protocol.REASON_ASR_ERROR
+                        )
+                    )
+                    return
                 except Exception:
                     logger.exception(
                         "asr failed item=%s bytes=%d", event.item_id, len(event.pcm)

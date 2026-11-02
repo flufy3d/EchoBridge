@@ -219,6 +219,8 @@ tokens, env files) is intentionally git-ignored.
 
 - [`docs/PHASE7.md`](docs/PHASE7.md) — single-process/CUDA-context refactor,
   memory and latency measurements, in-process TTS trade-off.
+- [`docs/ASR_RESILIENCE.md`](docs/ASR_RESILIENCE.md) — ASR probe/restart and
+  the `asr_unavailable` vs `empty speech` error contract.
 - [`docs/BENCHMARK.md`](docs/BENCHMARK.md) — Phase 6 baseline and acceptance
   measurements.
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — systemd, Windows WSL autostart,

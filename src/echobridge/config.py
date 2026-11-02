@@ -148,6 +148,14 @@ class Settings:
     # terms are injected as the request context/system prompt, so keep the list
     # short and verify with real recordings.
     asr_hotwords: tuple[str, ...] = ()
+    # Retry policy when the ASR worker is unavailable (connect/timeout/5xx).
+    # The same PCM is retried; the total budget covers the whole loop so a
+    # wedged worker cannot stall the turn.  A ~90 s worker restart is longer
+    # than this by design: the client gets an explicit retryable error instead
+    # of a misleading "empty speech".
+    asr_retry_attempts: int = 3
+    asr_retry_budget_s: float = 3.0
+    asr_retry_delay_ms: int = 300
 
     tts_backend: str = "mock"
     tts_url: str = "http://127.0.0.1:18802"
@@ -328,6 +336,11 @@ class Settings:
             asr_compile=_env_bool("ECHOBRIDGE_ASR_COMPILE", False),
             mock_asr_text=os.environ.get("ECHOBRIDGE_MOCK_ASR_TEXT", "你好呀"),
             asr_hotwords=_env_phrases("ECHOBRIDGE_ASR_HOTWORDS", ()),
+            asr_retry_attempts=_env_int("ECHOBRIDGE_ASR_RETRY_ATTEMPTS", 3),
+            asr_retry_budget_s=float(
+                os.environ.get("ECHOBRIDGE_ASR_RETRY_BUDGET_S", "3")
+            ),
+            asr_retry_delay_ms=_env_int("ECHOBRIDGE_ASR_RETRY_DELAY_MS", 300),
             tts_backend=os.environ.get("ECHOBRIDGE_TTS_BACKEND", "mock").strip().lower(),
             tts_url=os.environ.get("ECHOBRIDGE_TTS_URL", "http://127.0.0.1:18802").rstrip("/"),
             tts_timeout_s=float(os.environ.get("ECHOBRIDGE_TTS_TIMEOUT_S", "30")),

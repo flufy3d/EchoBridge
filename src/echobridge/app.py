@@ -327,6 +327,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
         workers = await _worker_health(settings, asr=shared_asr, tts=shared_tts)
+        asr_health = getattr(shared_asr, "asr_health", None)
+        if asr_health is not None and "asr" in workers:
+            workers["asr"] = {**workers["asr"], **asr_health.snapshot()}
         ok = all(bool(item.get("ok")) for item in workers.values())
         scheduler = get_gpu_scheduler()
         payload = {
@@ -379,6 +382,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     f"{int(memory.reserved_mb * 1024 * 1024)}",
                 ]
             )
+        asr_health = getattr(shared_asr, "asr_health", None)
+        if asr_health is not None:
+            lines.extend(asr_health.metrics_lines())
         return "\n".join(lines) + "\n"
 
     @app.get("/voices")

@@ -33,6 +33,25 @@ def test_response_done_reason_is_additive():
     assert failed["reason"] == "tts_unavailable"
 
 
+def test_asr_failed_reason_is_additive():
+    legacy = protocol.asr_failed("item_1", "empty speech")
+    assert legacy == {
+        "type": "conversation.item.input_audio_transcription.failed",
+        "item_id": "item_1",
+        "error": "empty speech",
+    }
+
+    unavailable = protocol.asr_failed(
+        "item_2",
+        protocol.REASON_ASR_UNAVAILABLE,
+        reason=protocol.REASON_ASR_UNAVAILABLE,
+        retryable=True,
+    )
+    assert unavailable["error"] == "asr_unavailable"
+    assert unavailable["reason"] == "asr_unavailable"
+    assert unavailable["retryable"] is True
+
+
 def test_tool_call_items_shape():
     ctx = protocol.ResponseContext("resp_2", 2)
     event = protocol.tool_call_done(

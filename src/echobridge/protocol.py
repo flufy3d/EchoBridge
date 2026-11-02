@@ -56,6 +56,9 @@ REASON_TTS_UNAVAILABLE = "tts_unavailable"
 REASON_TTS_ERROR = "tts_error"
 REASON_LLM_ERROR = "llm_error"
 REASON_ASR_ERROR = "asr_error"
+# The ASR worker itself is down/restarting; the utterance may be retried and
+# must not be reported to the user as "we did not hear you".
+REASON_ASR_UNAVAILABLE = "asr_unavailable"
 
 
 @dataclass(slots=True)
@@ -182,8 +185,24 @@ def asr_completed(item_id: str, transcript: str, language: str = "zh") -> dict[s
     }
 
 
-def asr_failed(item_id: str, error: str) -> dict[str, Any]:
-    return {"type": ASR_FAILED, "item_id": item_id, "error": error}
+def asr_failed(
+    item_id: str,
+    error: str,
+    *,
+    reason: str | None = None,
+    retryable: bool = False,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": ASR_FAILED,
+        "item_id": item_id,
+        "error": error,
+    }
+    # Additive fields: old clients keep using ``error`` and ignore these.
+    if reason:
+        event["reason"] = reason
+    if retryable:
+        event["retryable"] = True
+    return event
 
 
 def _response_header(ctx: ResponseContext) -> dict[str, Any]:
