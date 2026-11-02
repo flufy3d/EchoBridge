@@ -154,6 +154,35 @@ journalctl --user -u echobridge-gateway -n 50 | grep -E 'keepalive|tts unavailab
 #   history 中有 assistant(tool_calls) + tool
 ```
 
+### 5.1 抓下一次 cudaErrorUnknown 的现场
+
+关闭 pin_memory 后如果仍然出现 `cudaErrorUnknown`，先打开 CUDA 驱动的
+错误日志，等下一次复现。CUDA 12.4+ 会把失败 API 的名称、参数和错误码写成
+`[CUDA][E] ...`，比 Python 只看到的 `cudaErrorUnknown` 更有定位价值。
+
+```bash
+# 用一个 systemd drop-in 只影响 TTS，不会被 deploy/install.sh 覆盖
+mkdir -p ~/.config/systemd/user/echobridge-tts.service.d
+cat > ~/.config/systemd/user/echobridge-tts.service.d/cuda-log.conf <<'EOF'
+[Service]
+Environment=CUDA_LOG_FILE=stderr
+EOF
+systemctl --user daemon-reload
+systemctl --user restart echobridge-tts
+
+# 下次崩溃后（日志走 journald，不需要额外文件）
+journalctl --user -u echobridge-tts --since "-10 min" \
+  | grep -E '\[CUDA\]|CUDA error|AcceleratorError'
+
+# 调查结束后关闭
+rm ~/.config/systemd/user/echobridge-tts.service.d/cuda-log.conf
+systemctl --user daemon-reload
+systemctl --user restart echobridge-tts
+```
+
+`EnvironmentFile` 里的变量也会被 gateway/ASR 继承，所以这里用 drop-in
+而不是直接写 `echobridge.env`，避免其它进程产生无关日志。
+
 ## 6. 已知边界
 
 - `cudaErrorUnknown` 的根因在 WSL2/DXG/驱动层，EchoBridge 不能在进程内修复
