@@ -16,8 +16,9 @@ immediately.  Every 2 minutes it reads the gateway `/readyz` and `/healthz`:
 
 - healthy TTS: no action;
 - TTS unavailable for 6 minutes, no active voice session: run
-  `wsl.exe --shutdown`, start the TTS/ASR/gateway services, and wait up to
-  5 minutes for recovery;
+  `wsl.exe --shutdown`, stop any legacy `echobridge-asr.service`/orphan ASR
+  process that could hold port 18801, start the TTS/ASR/gateway services, and
+  wait up to 5 minutes for recovery;
 - after a reset: 30-minute cooldown, so a failing host does not reset WSL in a
   loop.
 

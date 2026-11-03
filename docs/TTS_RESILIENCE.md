@@ -210,9 +210,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\install-wsl-w
 ```
 
 任务 **EchoBridge WSL Watchdog** 每 2 分钟检查网关；TTS 连续 6 分钟不可用
-且没有活跃语音会话时，执行 `wsl.exe --shutdown`，再启动
-TTS/ASR/gateway，最多等待 5 分钟恢复。重置后有 30 分钟冷却，避免反复
-重启整个 WSL。日志只写健康状态和动作：
+且没有活跃语音会话时，执行 `wsl.exe --shutdown`，先停掉可能占用 18801 的
+legacy `echobridge-asr.service`/orphan ASR 进程，再启动 TTS/ASR/gateway，
+最多等待 5 分钟恢复。重置后有 30 分钟冷却，避免反复重启整个 WSL。日志
+只写健康状态和动作：
 
 ```text
 var/wsl-watchdog.log

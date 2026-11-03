@@ -117,7 +117,9 @@ if ($DryRun) {
 & wsl.exe --shutdown
 Start-Sleep -Seconds 5
 
-$startCommand = "systemctl --user start echobridge-tts.service echobridge-asr-vllm.service echobridge-gateway.service"
+# A stale interactive session can start the legacy echobridge-asr.service on
+# 18801; stop it before the vLLM ASR unit tries to bind the same port.
+$startCommand = "systemctl --user stop echobridge-asr.service >/dev/null 2>&1 || true; pkill -f '[e]chobridge.asr_worker' >/dev/null 2>&1 || true; systemctl --user start echobridge-tts.service echobridge-asr-vllm.service echobridge-gateway.service"
 $started = $false
 for ($attempt = 1; $attempt -le 15; $attempt++) {
     $output = & wsl.exe -d $Distro --user $WslUser -e /bin/bash -lc $startCommand 2>&1
