@@ -84,11 +84,17 @@ assistant（文字 + tool_calls）和 tool 消息写入 history。下一轮模�
 
 - 启动 vLLM-Omni 子进程；
 - 等 `/health` 第一次 200（启动期 503 不计失败）；
-- 之后每 `ECHOBRIDGE_TTS_ENGINE_PROBE_S`（默认 5 s）检查一次；连续
+- 之后每 `ECHOBRIDGE_TTS_ENGINE_PROBE_S`（默认 2 s）检查一次；连续
   `ECHOBRIDGE_TTS_ENGINE_FAILURES`（默认 2）次 503 就 `SIGTERM` 子进程，
   让系统立即重启，而不是让 API server 一直返回 500。
 
 `ECHOBRIDGE_TTS_ENGINE_SUPERVISOR=0` 可退回旧行为。
+
+重启时序（2026-11-03 实测）：崩溃后 supervisor 约 4 s 发现 engine 死亡，
+systemd 约 2 s 拉起新进程，随后是约 2.5 min 的模型加载；从崩溃到
+`/readyz` 恢复约 3 min。**模型加载是恢复速度的下限**，不是 systemd 延迟。
+unit 现在使用 `RestartSec=2`、`StartLimitIntervalSec=600` 和
+`StartLimitBurst=10`，避免连续失败时被 systemd 的启动限流永久卡住。
 
 ### 3.3 空闲 keepalive
 

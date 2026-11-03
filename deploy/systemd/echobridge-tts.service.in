@@ -3,8 +3,10 @@ Description=EchoBridge TTS worker (Qwen3-TTS via vLLM-Omni)
 Documentation=file://@ROOT@/docs/DEPLOY.md
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=120
-StartLimitBurst=5
+# Do not give up after a handful of quick failures: a WSL2 CUDA context
+# failure can require several cold starts before a fresh process sticks.
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -18,10 +20,12 @@ ExecStart=/bin/bash @ROOT@/scripts/tts_vllm.sh
 # (the vLLM ASR worker) wait for a ready TTS instead of a forked process.
 ExecStartPost=/bin/bash @ROOT@/deploy/worker-ready.sh tts
 Restart=always
-RestartSec=8
+# Start the replacement as soon as the old cgroup is gone.  The model load
+# (~2 min) dominates recovery; this only removes avoidable systemd delay.
+RestartSec=2
 # Two-stage model load plus CUDA graph capture takes ~2 min on a 3070.
 TimeoutStartSec=600
-TimeoutStopSec=45
+TimeoutStopSec=20
 KillMode=control-group
 LimitNOFILE=65535
 NoNewPrivileges=true
