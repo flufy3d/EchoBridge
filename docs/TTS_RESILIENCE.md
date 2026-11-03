@@ -199,3 +199,24 @@ systemctl --user restart echobridge-tts
 - 工具执行仍由 app 负责。若 TTS 失败后 app 不返回 tool result，网关会写一条
   “工具调用未完成，请勿重复调用” 的占位 tool 消息，保证下一轮 OpenAI
   tool-call 链合法。
+
+### 6.1 Windows 侧 WSL 自愈
+
+只用 TTS/systemd 重启仍然要求 WSL 能创建新的 CUDA context。如果 WSL 的
+GPU/DXG 路径完全卡死，TTS 会连续重启失败；这时由 Windows 侧任务兜底：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\install-wsl-watchdog.ps1
+```
+
+任务 **EchoBridge WSL Watchdog** 每 2 分钟检查网关；TTS 连续 6 分钟不可用
+且没有活跃语音会话时，执行 `wsl.exe --shutdown`，再启动
+TTS/ASR/gateway，最多等待 5 分钟恢复。重置后有 30 分钟冷却，避免反复
+重启整个 WSL。日志只写健康状态和动作：
+
+```text
+var/wsl-watchdog.log
+```
+
+正常 TTS 崩溃仍在约 3 分钟内由 systemd 恢复，不会被这个任务误判；只有
+超过 6 分钟仍未恢复才升级为 WSL 重置。
