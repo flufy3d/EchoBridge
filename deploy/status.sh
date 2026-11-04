@@ -45,8 +45,12 @@ curl -fsS --max-time 3 "${URL}/metrics" 2>/dev/null || true
 
 echo
 echo "== voice models =="
-nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu \
-  --format=csv,noheader 2>/dev/null || echo "nvidia-smi unavailable"
+# Under WSL2 the Linux nvidia-smi leaks NVRM pool in the Windows driver on
+# every run (docs/WSL_GPU_LEAK.md); the Windows binary does not.
+NVSMI=nvidia-smi
+[[ -x /mnt/c/Windows/System32/nvidia-smi.exe ]] && NVSMI=/mnt/c/Windows/System32/nvidia-smi.exe
+"$NVSMI" --query-gpu=name,memory.used,memory.total,utilization.gpu \
+  --format=csv,noheader 2>/dev/null | tr -d '\r' || echo "nvidia-smi unavailable"
 
 if command -v tailscale >/dev/null 2>&1; then
   echo

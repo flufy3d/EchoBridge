@@ -46,10 +46,21 @@ fi
 # a full card.  Use nvidia-smi: it reports the whole device, while a WSL2
 # process's cudaMemGetInfo() ignores every other process (it shows ~6.9 GiB
 # free with the TTS worker resident and nvidia-smi at ~2.5 GiB).
+#
+# Under WSL2 run the Windows binary instead of the Linux one.  Every Linux
+# nvidia-smi run opens an NVML session that leaks 21 objects (~7.5 KiB) in the
+# Windows driver's NVRM non-paged pool until Windows reboots (measured on
+# driver 617.14, see docs/WSL_GPU_LEAK.md); the Windows binary reports the
+# same numbers and leaks nothing.  Its output ends lines with CRLF.
+NVSMI="${ECHOBRIDGE_NVIDIA_SMI:-}"
+if [[ -z "$NVSMI" ]]; then
+  NVSMI=nvidia-smi
+  [[ -x /mnt/c/Windows/System32/nvidia-smi.exe ]] && NVSMI=/mnt/c/Windows/System32/nvidia-smi.exe
+fi
 if ((MIN_FREE_MB > 0)); then
   deadline=$((SECONDS + GPU_WAIT_S))
   while :; do
-    FREE_MB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')"
+    FREE_MB="$("$NVSMI" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' \r')"
     if [[ "$FREE_MB" =~ ^[0-9]+$ ]] && ((FREE_MB >= MIN_FREE_MB)); then
       break
     fi
