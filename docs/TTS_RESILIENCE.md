@@ -209,7 +209,7 @@ GPU/DXG 路径完全卡死，TTS 会连续重启失败；这时由 Windows 侧�
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\install-wsl-watchdog.ps1
 ```
 
-任务 **EchoBridge WSL Watchdog** 每 2 分钟检查网关；TTS 连续 6 分钟不可用
+任务 **EchoBridge WSL Watchdog** 每 2 分钟检查网关；TTS 连续 10 分钟不可用
 且没有活跃语音会话时，执行 `wsl.exe --shutdown`，先停掉可能占用 18801 的
 legacy `echobridge-asr.service`/orphan ASR 进程，再启动 TTS/ASR/gateway，
 最多等待 5 分钟恢复。重置后有 30 分钟冷却，避免反复重启整个 WSL。日志
@@ -219,5 +219,15 @@ legacy `echobridge-asr.service`/orphan ASR 进程，再启动 TTS/ASR/gateway，
 var/wsl-watchdog.log
 ```
 
-正常 TTS 崩溃仍在约 3 分钟内由 systemd 恢复，不会被这个任务误判；只有
-超过 6 分钟仍未恢复才升级为 WSL 重置。
+正常 TTS 崩溃在 83–113 s 内由 systemd 恢复（页缓存是热的）。冷启动要慢得多：
+WSL 磁盘 `D:\WSL\Ubuntu-26.04\ext4.vhdx` 在机械硬盘（WD10EFRX）上，Windows
+重启或 WSL 重置后要从盘上读 venv 和模型。2026-11-04 实测，从登录到网关就绪
+7.5 min，从 watchdog 重置到就绪 7 min（Python 导入 2 分 13 秒，权重 27 s，
+约 70 MB/s）。阈值因此是 10 分钟；原来的 6 分钟在开机冷启动时只差 0.1 分钟就会
+误重置。
+
+2026-11-04 17:09 在 WSL 运行时更新 Windows 驱动（617.14 → 621.14）后，WSL
+里的 NVML 报 `Generic operating system error`，TTS 进程卡在 dxg 调用里无法
+被 SIGKILL 结束，只有 `wsl --shutdown` 能恢复。这是 watchdog 第一次在真实
+故障中触发：17:19:40 重置，17:26:39 恢复。更新驱动后应主动执行
+`wsl --shutdown`。

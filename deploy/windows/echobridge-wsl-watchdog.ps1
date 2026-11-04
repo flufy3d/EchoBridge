@@ -2,15 +2,17 @@
 #
 # Runs on Windows (not inside WSL) so it can reset a wedged WSL instance with
 # `wsl.exe --shutdown`.  It only acts when TTS has been unavailable for several
-# minutes and no voice session is active.  Normal TTS restarts take about
-# 3 minutes because vLLM reloads the model; the 6-minute threshold avoids
-# resetting WSL during those restarts.
+# minutes and no voice session is active.  A TTS crash restart takes about
+# 1.5 minutes with a warm page cache, but a cold start after a Windows reboot
+# or WSL reset reads the venvs and models from the HDD that holds the WSL
+# disk: 7.5 minutes to a ready gateway on 2026-11-04, which a 6-minute
+# threshold would have cut short.  The 10-minute threshold covers that.
 #
 # Register with deploy/windows/install-wsl-watchdog.ps1.
 param(
     [string]$Distro = "Ubuntu-26.04",
     [string]$WslUser = "flufy3d",
-    [int]$FailureMinutes = 6,
+    [int]$FailureMinutes = 10,
     [int]$CooldownMinutes = 30,
     [string]$GatewayUrl = "http://127.0.0.1:18787",
     [switch]$DryRun
